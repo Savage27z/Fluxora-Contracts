@@ -7,7 +7,12 @@ Notes for auditors and maintainers on security-relevant patterns used in the Flu
 The contract follows the **Checks-Effects-Interactions** pattern to reduce reentrancy risk.
 State updates are performed **before** any external token transfers in all functions that move funds.
 
-### `withdraw`
+- **`create_streams`**  
+  The contract requires sender auth once, validates every batch entry first, and computes the total deposit with checked arithmetic before any token transfer. It then performs one pull transfer for the total and persists streams. If any validation/overflow/transfer step fails, Soroban reverts the transaction: no streams are stored and no creation events remain on-chain.
+
+- **`withdraw`**  
+  After all checks (auth, status, withdrawable amount), the contract updates `withdrawn_amount` and, when applicable, sets status to `Completed`, then persists the stream with `save_stream`. Only after that does it call the token contract to transfer tokens to the recipient.
+  Completion is only allowed from `Active` status; cancelled streams remain `Cancelled` even when their accrued portion is fully withdrawn.
 
 After all checks (auth, status, withdrawable amount), the contract:
 1. Updates `withdrawn_amount` in the stream struct.
@@ -21,6 +26,16 @@ After checks and computing the refund amount, the contract:
 1. Sets `stream.status = Cancelled` and records `cancelled_at`.
 2. Calls `save_stream` to persist the updated state.
 3. **Only then** transfers the unstreamed refund to the sender.
+
+Both sender/admin cancellation entrypoints route through the same internal logic.
+This guarantees identical externally visible semantics (state fields, refund math,
+and emitted event shape) regardless of which authorized role executed the cancel.
+
+Refund invariant for reviewers:
+
+`refund_amount = deposit_amount - accrued_at(cancelled_at)`
+
+where `accrued_at(cancelled_at)` is frozen for all future reads after cancellation.
 
 ### `top_up_stream`
 
@@ -83,6 +98,12 @@ reentrancy impact — state will already reflect the current operation when the 
 | `set_admin`            | Current contract admin                      |
 | `set_contract_paused`  | Contract admin                              |
 
+Cancellation-specific boundary checks:
+
+1. Sender path (`cancel_stream`) cannot be executed by recipient or third party.
+2. Admin path (`cancel_stream_as_admin`) cannot be executed by non-admin callers.
+3. Streams in terminal states (`Completed`, `Cancelled`) are rejected with `InvalidState`.
+
 ---
 
 ## Overflow protection
@@ -113,6 +134,10 @@ instance storage under `DataKey::GlobalPaused`.
 
 ## Re-initialization prevention
 
-`init` checks for the presence of `DataKey::Config` in instance storage and panics
-with `"already initialised"` if called a second time. This prevents an attacker from
-repointing the contract to a different token address or replacing the admin after deployment.
+`init` is bootstrap-authenticated and one-shot:
+
+- It requires `admin.require_auth()` from the declared bootstrap admin.
+- It checks `DataKey::Config` and panics with `"already initialised"` on any second call.
+
+This prevents unauthorized bootstrap and prevents later repointing to a different token
+address or replacing the admin through `init`.
