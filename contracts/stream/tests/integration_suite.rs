@@ -2117,3 +2117,289 @@ fn integration_batch_withdraw_completed_streams_yield_zero() {
     // Contract holds only the remaining 400 for id1
     assert_eq!(ctx.token.balance(&ctx.contract_id), 400);
 }
+
+// ===========================================================================
+// Integration regression: double-init and missing-config reads (Issue #246)
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Double-init: integration scenarios
+// ---------------------------------------------------------------------------
+
+/// Full integration: double-init attempt must not affect fund flows.
+/// Creates a stream, attempts re-init, then verifies that withdrawal/balance
+/// accounting is perfectly intact.
+#[test]
+fn integration_double_init_does_not_affect_fund_flows() {
+    let ctx = TestContext::setup();
+
+    let sender_initial = ctx.token.balance(&ctx.sender);
+    let contract_initial = ctx.token.balance(&ctx.contract_id);
+
+    // Create stream
+    let stream_id = ctx.create_default_stream();
+    assert_eq!(ctx.token.balance(&ctx.sender), sender_initial - 1000);
+    assert_eq!(ctx.token.balance(&ctx.contract_id), contract_initial + 1000);
+
+    // Attempt re-init (should fail)
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ctx.client().init(&ctx.token_id, &ctx.admin);
+    }));
+    assert!(result.is_err());
+
+    // Balances must be unchanged by re-init attempt
+    assert_eq!(
+        ctx.token.balance(&ctx.sender),
+        sender_initial - 1000,
+        "sender balance must not change after failed re-init"
+    );
+    assert_eq!(
+        ctx.token.balance(&ctx.contract_id),
+        contract_initial + 1000,
+        "contract balance must not change after failed re-init"
+    );
+
+    // Withdrawal still works perfectly
+    ctx.env.ledger().set_timestamp(500);
+    let withdrawn = ctx.client().withdraw(&stream_id);
+    assert_eq!(withdrawn, 500);
+    assert_eq!(ctx.token.balance(&ctx.recipient), 500);
+    assert_eq!(ctx.token.balance(&ctx.contract_id), 500);
+
+    // Complete the stream
+    ctx.env.ledger().set_timestamp(1000);
+    let final_withdrawn = ctx.client().withdraw(&stream_id);
+    assert_eq!(final_withdrawn, 500);
+
+    // Verify final state
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Completed);
+    assert_eq!(ctx.token.balance(&ctx.recipient), 1000);
+    assert_eq!(ctx.token.balance(&ctx.contract_id), 0);
+}
+
+/// Double-init must not affect cancellation and refund mechanics.
+#[test]
+fn integration_double_init_does_not_affect_cancel_refund() {
+    let ctx = TestContext::setup();
+
+    let stream_id = ctx.create_default_stream();
+    let sender_after_create = ctx.token.balance(&ctx.sender);
+
+    // Attempt re-init
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ctx.client()
+            .init(&Address::generate(&ctx.env), &Address::generate(&ctx.env));
+    }));
+
+    // Cancel at t=400 — should refund 600 to sender
+    ctx.env.ledger().set_timestamp(400);
+    ctx.client().cancel_stream(&stream_id);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Cancelled);
+    assert_eq!(state.cancelled_at, Some(400));
+    assert_eq!(
+        ctx.token.balance(&ctx.sender),
+        sender_after_create + 600,
+        "sender must receive correct refund after re-init attempt"
+    );
+    assert_eq!(
+        ctx.token.balance(&ctx.contract_id),
+        400,
+        "contract must retain accrued amount"
+    );
+
+    // Recipient can still withdraw accrued amount
+    let withdrawn = ctx.client().withdraw(&stream_id);
+    assert_eq!(withdrawn, 400);
+    assert_eq!(ctx.token.balance(&ctx.recipient), 400);
+    assert_eq!(ctx.token.balance(&ctx.contract_id), 0);
+}
+
+/// Config immutability persists through multiple re-init attempts with
+/// different parameter combinations.
+#[test]
+fn integration_config_immutable_through_multiple_reinit_permutations() {
+    let ctx = TestContext::setup();
+    let original_config = ctx.client().get_config();
+
+    // Try 4 different re-init permutations
+    let permutations: [(bool, bool); 4] = [
+        (true, true),   // same token, same admin
+        (true, false),  // same token, different admin
+        (false, true),  // different token, same admin
+        (false, false), // different token, different admin
+    ];
+
+    for (use_same_token, use_same_admin) in permutations {
+        let token = if use_same_token {
+            ctx.token_id.clone()
+        } else {
+            Address::generate(&ctx.env)
+        };
+        let admin = if use_same_admin {
+            ctx.admin.clone()
+        } else {
+            Address::generate(&ctx.env)
+        };
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ctx.client().init(&token, &admin);
+        }));
+        assert!(result.is_err());
+    }
+
+    // Config must still match original
+    let config = ctx.client().get_config();
+    assert_eq!(config.token, original_config.token);
+    assert_eq!(config.admin, original_config.admin);
+}
+
+/// Stream counter continuity: create, re-init attempt, create again — IDs sequential.
+#[test]
+fn integration_stream_counter_continuous_after_reinit() {
+    let ctx = TestContext::setup();
+
+    let id0 = ctx.create_default_stream();
+    assert_eq!(id0, 0);
+
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ctx.client().init(&ctx.token_id, &ctx.admin);
+    }));
+
+    ctx.env.ledger().set_timestamp(0);
+    let id1 = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1000u64,
+    );
+    assert_eq!(id1, 1, "second stream must get ID 1");
+    assert_eq!(ctx.client().get_stream_count(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// Missing-config: integration scenarios
+// ---------------------------------------------------------------------------
+
+/// Full integration: uninitialised contract gives clear error for get_config.
+#[test]
+#[should_panic(expected = "contract not initialised: missing config")]
+fn integration_uninitialised_get_config_panics() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, FluxoraStream);
+    let client = FluxoraStreamClient::new(&env, &contract_id);
+    client.get_config();
+}
+
+/// Uninitialised contract: create_stream must panic with missing config.
+#[test]
+#[should_panic(expected = "contract not initialised: missing config")]
+fn integration_uninitialised_create_stream_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FluxoraStream);
+    let client = FluxoraStreamClient::new(&env, &contract_id);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    env.ledger().set_timestamp(0);
+    client.create_stream(
+        &sender, &recipient, &1000_i128, &1_i128, &0u64, &0u64, &1000u64,
+    );
+}
+
+/// Uninitialised contract: admin operations must panic with missing config.
+#[test]
+#[should_panic(expected = "contract not initialised: missing config")]
+fn integration_uninitialised_admin_cancel_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FluxoraStream);
+    let client = FluxoraStreamClient::new(&env, &contract_id);
+    client.cancel_stream_as_admin(&0);
+}
+
+/// Uninitialised contract: version is still readable (no config dependency).
+#[test]
+fn integration_uninitialised_version_works() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, FluxoraStream);
+    let client = FluxoraStreamClient::new(&env, &contract_id);
+    assert_eq!(client.version(), 1);
+}
+
+/// Uninitialised contract: stream count returns 0.
+#[test]
+fn integration_uninitialised_stream_count_zero() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, FluxoraStream);
+    let client = FluxoraStreamClient::new(&env, &contract_id);
+    assert_eq!(client.get_stream_count(), 0);
+}
+
+/// Uninitialised contract: get_stream_state for non-existent stream fails.
+#[test]
+fn integration_uninitialised_get_stream_state_fails() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, FluxoraStream);
+    let client = FluxoraStreamClient::new(&env, &contract_id);
+    let result = client.try_get_stream_state(&0);
+    assert!(result.is_err());
+}
+
+/// Uninitialised contract: set_contract_paused must fail with missing config.
+#[test]
+#[should_panic(expected = "contract not initialised: missing config")]
+fn integration_uninitialised_set_contract_paused_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FluxoraStream);
+    let client = FluxoraStreamClient::new(&env, &contract_id);
+    client.set_contract_paused(&true);
+}
+
+/// After initialisation, all previously-failing paths become functional.
+/// This verifies init correctly unblocks the full contract surface.
+#[test]
+fn integration_init_unblocks_all_paths() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FluxoraStream);
+    let client = FluxoraStreamClient::new(&env, &contract_id);
+
+    // Before init: get_config must fail
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.get_config();
+    }));
+    assert!(result.is_err(), "get_config must fail before init");
+
+    // Initialise
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    let admin = Address::generate(&env);
+    client.init(&token_id, &admin);
+
+    // After init: get_config must succeed
+    let config = client.get_config();
+    assert_eq!(config.token, token_id);
+    assert_eq!(config.admin, admin);
+
+    // After init: create_stream must succeed
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let sac = StellarAssetClient::new(&env, &token_id);
+    sac.mint(&sender, &10_000_i128);
+
+    env.ledger().set_timestamp(0);
+    let stream_id = client.create_stream(
+        &sender, &recipient, &1000_i128, &1_i128, &0u64, &0u64, &1000u64,
+    );
+    assert_eq!(stream_id, 0);
+    assert_eq!(client.get_stream_count(), 1);
+}
