@@ -6,6 +6,7 @@ as the canonical source of truth for indexers and backend parsers. The schemas
 below are derived directly from the contract source `contracts/stream/src/lib.rs`.
 
 Notes:
+
 - Soroban events contain an ordered list of topics and a single `data` payload.
 - Topics shown below are the literal values used in `env.events().publish(...)`.
 - Types use the contract's Rust types (e.g. `u64`, `i128`, `Address`).
@@ -137,13 +138,13 @@ pub enum StreamEvent {
 }
 ```
 
-| Function(s)                                  | Topic          | Data enum variant              |
-|----------------------------------------------|----------------|--------------------------------|
-| `pause_stream`, `pause_stream_as_admin`      | `"paused"`     | `StreamEvent::Paused(id)`      |
-| `resume_stream`, `resume_stream_as_admin`    | `"resumed"`    | `StreamEvent::Resumed(id)`     |
-| `cancel_stream`, `cancel_stream_as_admin`    | `"cancelled"`  | `StreamEvent::StreamCancelled(id)` |
-| `withdraw`, `batch_withdraw` (final drain on Active streams) | `"completed"`  | `StreamEvent::StreamCompleted(id)` |
-| `close_completed_stream`                     | `"closed"`     | `StreamEvent::StreamClosed(id)` |
+| Function(s)                                                  | Topic         | Data enum variant                  |
+| ------------------------------------------------------------ | ------------- | ---------------------------------- |
+| `pause_stream`, `pause_stream_as_admin`                      | `"paused"`    | `StreamEvent::Paused(id)`          |
+| `resume_stream`, `resume_stream_as_admin`                    | `"resumed"`   | `StreamEvent::Resumed(id)`         |
+| `cancel_stream`, `cancel_stream_as_admin`                    | `"cancelled"` | `StreamEvent::StreamCancelled(id)` |
+| `withdraw`, `batch_withdraw` (final drain on Active streams) | `"completed"` | `StreamEvent::StreamCompleted(id)` |
+| `close_completed_stream`                                     | `"closed"`    | `StreamEvent::StreamClosed(id)`    |
 
 Example (cancelled):
 
@@ -266,8 +267,9 @@ If you change event topics or payloads in the contract, please update this
 document to match and include example snapshots.
 
 ---
+
 Commit message suggestion: `docs: add event schema and topics for indexers`
-| Source location                                              | Symbol emitted  |
+| Source location | Symbol emitted |
 |--------------------------------------------------------------|-----------------|
 | `persist_new_stream`                                         | `"created"`     |
 | `withdraw`, `batch_withdraw`                                 | `"withdrew"`    |
