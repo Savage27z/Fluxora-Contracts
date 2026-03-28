@@ -615,7 +615,8 @@ fn top_up_stream_on_paused_stream_preserves_status_and_schedule() {
     let state_before = ctx.client().get_stream_state(&stream_id);
     assert_eq!(state_before.status, StreamStatus::Paused);
 
-    ctx.client().top_up_stream(&stream_id, &ctx.sender, &300_i128);
+    ctx.client()
+        .top_up_stream(&stream_id, &ctx.sender, &300_i128);
 
     let state_after = ctx.client().get_stream_state(&stream_id);
     assert_eq!(state_after.status, StreamStatus::Paused);
@@ -643,7 +644,9 @@ fn top_up_stream_completed_failure_emits_no_event() {
     let contract_balance_before = ctx.token.balance(&ctx.contract_id);
     let events_before = ctx.env.events().all().len();
 
-    let result = ctx.client().try_top_up_stream(&stream_id, &ctx.sender, &100_i128);
+    let result = ctx
+        .client()
+        .try_top_up_stream(&stream_id, &ctx.sender, &100_i128);
     assert_eq!(result, Err(Ok(ContractError::InvalidState)));
 
     let state_after = ctx.client().get_stream_state(&stream_id);

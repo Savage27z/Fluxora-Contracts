@@ -3938,7 +3938,8 @@ fn test_top_up_stream_sender_auth_success_strict() {
         },
     }]);
 
-    ctx.client().top_up_stream(&stream_id, &ctx.sender, &400_i128);
+    ctx.client()
+        .top_up_stream(&stream_id, &ctx.sender, &400_i128);
 
     let state = ctx.client().get_stream_state(&stream_id);
     assert_eq!(state.deposit_amount, 1_400);
@@ -3989,7 +3990,10 @@ fn test_top_up_stream_allows_third_party_funder_and_emits_payload() {
     assert_eq!(state.withdrawn_amount, 0);
 
     assert_eq!(ctx.token().balance(&ctx.sender), sender_balance_before);
-    assert_eq!(ctx.token().balance(&treasury), treasury_balance_before - 750);
+    assert_eq!(
+        ctx.token().balance(&treasury),
+        treasury_balance_before - 750
+    );
     assert_eq!(
         ctx.token().balance(&ctx.contract_id),
         contract_balance_before + 750
@@ -4026,7 +4030,8 @@ fn test_top_up_stream_paused_preserves_schedule_and_status() {
     let state_before = ctx.client().get_stream_state(&stream_id);
     assert_eq!(state_before.status, StreamStatus::Paused);
 
-    ctx.client().top_up_stream(&stream_id, &ctx.sender, &250_i128);
+    ctx.client()
+        .top_up_stream(&stream_id, &ctx.sender, &250_i128);
 
     let state_after = ctx.client().get_stream_state(&stream_id);
     assert_eq!(state_after.stream_id, state_before.stream_id);
@@ -4060,13 +4065,18 @@ fn test_top_up_stream_fails_for_terminal_states() {
     let contract_balance_before = ctx.token().balance(&ctx.contract_id);
     let events_before = ctx.env.events().all().len();
 
-    let result = ctx.client().try_top_up_stream(&stream_id, &ctx.sender, &100_i128);
+    let result = ctx
+        .client()
+        .try_top_up_stream(&stream_id, &ctx.sender, &100_i128);
     assert_eq!(result, Err(Ok(ContractError::InvalidState)));
 
     let state_after = ctx.client().get_stream_state(&stream_id);
     assert_eq!(state_after.deposit_amount, deposit_before);
     assert_eq!(ctx.token().balance(&ctx.sender), sender_balance_before);
-    assert_eq!(ctx.token().balance(&ctx.contract_id), contract_balance_before);
+    assert_eq!(
+        ctx.token().balance(&ctx.contract_id),
+        contract_balance_before
+    );
     assert_eq!(ctx.env.events().all().len(), events_before);
 }
 
@@ -4079,7 +4089,9 @@ fn test_top_up_stream_rejects_non_positive_amount() {
     let contract_balance_before = ctx.token().balance(&ctx.contract_id);
     let events_before = ctx.env.events().all().len();
 
-    let result_zero = ctx.client().try_top_up_stream(&stream_id, &ctx.sender, &0_i128);
+    let result_zero = ctx
+        .client()
+        .try_top_up_stream(&stream_id, &ctx.sender, &0_i128);
     assert_eq!(result_zero, Err(Ok(ContractError::InvalidParams)));
 
     let result_negative = ctx
@@ -4091,7 +4103,10 @@ fn test_top_up_stream_rejects_non_positive_amount() {
     assert_eq!(state_after.deposit_amount, state_before.deposit_amount);
     assert_eq!(state_after.status, state_before.status);
     assert_eq!(ctx.token().balance(&ctx.sender), sender_balance_before);
-    assert_eq!(ctx.token().balance(&ctx.contract_id), contract_balance_before);
+    assert_eq!(
+        ctx.token().balance(&ctx.contract_id),
+        contract_balance_before
+    );
     assert_eq!(ctx.env.events().all().len(), events_before);
 }
 
@@ -4117,14 +4132,18 @@ fn test_top_up_stream_rejects_impersonated_funder_and_emits_no_event_strict() {
     }]);
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        ctx.client().top_up_stream(&stream_id, &ctx.sender, &100_i128);
+        ctx.client()
+            .top_up_stream(&stream_id, &ctx.sender, &100_i128);
     }));
     assert!(result.is_err(), "impersonated funder auth must be rejected");
 
     let state_after = ctx.client().get_stream_state(&stream_id);
     assert_eq!(state_after.deposit_amount, deposit_before);
     assert_eq!(ctx.token().balance(&ctx.sender), sender_balance_before);
-    assert_eq!(ctx.token().balance(&ctx.contract_id), contract_balance_before);
+    assert_eq!(
+        ctx.token().balance(&ctx.contract_id),
+        contract_balance_before
+    );
     assert_eq!(ctx.env.events().all().len(), events_before);
 }
 
