@@ -4,10 +4,14 @@ extern crate std;
 use soroban_sdk::{
     testutils::{Address as _, Events, Ledger},
     token::{Client as TokenClient, StellarAssetClient},
-    Address, Env, IntoVal,
+    Address, Env, FromVal, IntoVal, Symbol, TryFromVal, Val, Vec,
 };
 
-use crate::{Config, ContractError, FluxoraStream, FluxoraStreamClient};
+use crate::{
+    Config, ContractError, ContractPauseChanged, CreateStreamParams, FluxoraStream,
+    FluxoraStreamClient, GlobalEmergencyPauseChanged, StreamCreated, StreamEndShortened,
+    StreamEvent, StreamStatus, StreamToppedUp, WithdrawalTo,
+};
 
 // ---------------------------------------------------------------------------
 // Test helpers
