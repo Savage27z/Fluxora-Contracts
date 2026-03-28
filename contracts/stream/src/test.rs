@@ -4,14 +4,11 @@ extern crate std;
 use soroban_sdk::{
     testutils::{Address as _, Events, Ledger},
     token::{Client as TokenClient, StellarAssetClient},
-    Address, Env, FromVal, IntoVal, Symbol, TryFromVal, Val, Vec,
+    Address, Env, IntoVal,
 };
 
 use crate::{
-    BatchWithdrawResult, Config, ContractError, ContractPauseChanged, CreateStreamParams,
-    FluxoraStream, FluxoraStreamClient, GlobalEmergencyPauseChanged, GlobalResumed, Stream,
-    StreamCreated, StreamEndExtended, StreamEndShortened, StreamEvent, StreamStatus,
-    StreamToppedUp, Withdrawal, WithdrawalTo,
+    Config, ContractError, FluxoraStream, FluxoraStreamClient,
 };
 
 // ---------------------------------------------------------------------------
@@ -15797,7 +15794,9 @@ mod i128_boundary_streams {
 
     /// A safe large deposit: rate=1, duration=i128::MAX/2 seconds.
     /// Avoids rate*duration overflow while exercising large deposit values.
+    #[allow(dead_code)]
     const LARGE_DEPOSIT_RATE1: i128 = 1_000_000_000_000_000_000_i128; // 10^18
+    #[allow(dead_code)]
     const LARGE_DEPOSIT_DURATION: u64 = 1_000_000_000_000_000_000_u64; // 10^18 s
 
     fn setup_with_balance(balance: i128) -> (Env, Address, Address, Address, Address, Address) {
@@ -16194,7 +16193,7 @@ mod i128_boundary_streams {
         // Use rate=1 and a round deposit to avoid integer division truncation
         let rate: i128 = 1;
         let duration: u64 = 1_000;
-        let large_deposit: i128 = rate * duration as i128; // exactly 1000
+        let _large_deposit: i128 = rate * duration as i128; // exactly 1000
                                                            // Mint a large amount but use a clean deposit for precision
         let large_deposit: i128 = i128::MAX / 1_000_000 / 1_000 * 1_000; // divisible by 1000
         let rate: i128 = large_deposit / 1_000;
