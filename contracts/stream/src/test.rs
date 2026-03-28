@@ -14114,6 +14114,268 @@ fn claimable_at_cancel_ceiling_parametric() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// §12  Additional edge case tests
+// ---------------------------------------------------------------------------
+
+/// Test that batch_withdraw correctly handles a mix of streams with different
+/// statuses (Active, Paused, Cancelled, Completed) and only processes valid ones.
+/// This ensures the batch operation is robust against heterogeneous stream states.
+#[test]
+fn test_batch_withdraw_mixed_stream_states_comprehensive() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+
+    // Create 5 streams with different eventual states
+    let id_active = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1000u64,
+    );
+
+    let id_paused = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1000u64,
+    );
+
+    let id_cancelled = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1000u64,
+    );
+
+    let id_completed = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1000u64,
+    );
+
+    let id_active_2 = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &2000_i128,
+        &2_i128,
+        &0u64,
+        &0u64,
+        &1000u64,
+    );
+
+    // Set up different states
+    ctx.env.ledger().set_timestamp(500);
+    
+    // Pause one stream
+    ctx.client().pause_stream(&id_paused);
+    
+    // Cancel one stream (accrued = 500)
+    ctx.client().cancel_stream(&id_cancelled);
+    
+    // Complete one stream
+    ctx.env.ledger().set_timestamp(1000);
+    ctx.client().withdraw(&id_completed);
+    
+    // Verify states
+    assert_eq!(ctx.client().get_stream_state(&id_active).status, StreamStatus::Active);
+    assert_eq!(ctx.client().get_stream_state(&id_paused).status, StreamStatus::Paused);
+    assert_eq!(ctx.client().get_stream_state(&id_cancelled).status, StreamStatus::Cancelled);
+    assert_eq!(ctx.client().get_stream_state(&id_completed).status, StreamStatus::Completed);
+    assert_eq!(ctx.client().get_stream_state(&id_active_2).status, StreamStatus::Active);
+
+    // Attempt batch withdraw at t=800
+    ctx.env.ledger().set_timestamp(800);
+    
+    let mut stream_ids = Vec::new(&ctx.env);
+    stream_ids.push_back(id_active);
+    stream_ids.push_back(id_paused);
+    stream_ids.push_back(id_cancelled);
+    stream_ids.push_back(id_completed);
+    stream_ids.push_back(id_active_2);
+
+    // This should panic because paused stream is in the batch
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ctx.client().batch_withdraw(&ctx.recipient, &stream_ids);
+    }));
+    
+    assert!(result.is_err(), "batch_withdraw with paused stream should panic");
+
+    // Now try without the paused stream
+    let mut valid_stream_ids = Vec::new(&ctx.env);
+    valid_stream_ids.push_back(id_active);
+    valid_stream_ids.push_back(id_cancelled);
+    valid_stream_ids.push_back(id_completed);
+    valid_stream_ids.push_back(id_active_2);
+
+    let results = ctx.client().batch_withdraw(&ctx.recipient, &valid_stream_ids);
+
+    // Verify results
+    assert_eq!(results.len(), 4);
+    
+    // Active stream: accrued=800, withdrawn=0 → amount=800
+    assert_eq!(results.get(0).unwrap().stream_id, id_active);
+    assert_eq!(results.get(0).unwrap().amount, 800);
+    
+    // Cancelled stream: accrued frozen at 500, withdrawn=0 → amount=500
+    assert_eq!(results.get(1).unwrap().stream_id, id_cancelled);
+    assert_eq!(results.get(1).unwrap().amount, 500);
+    
+    // Completed stream: nothing left → amount=0
+    assert_eq!(results.get(2).unwrap().stream_id, id_completed);
+    assert_eq!(results.get(2).unwrap().amount, 0);
+    
+    // Active stream 2: accrued=1600 (rate=2), withdrawn=0 → amount=1600
+    assert_eq!(results.get(3).unwrap().stream_id, id_active_2);
+    assert_eq!(results.get(3).unwrap().amount, 1600);
+
+    // Verify total tokens transferred
+    let expected_total = 800 + 500 + 0 + 1600;
+    assert_eq!(ctx.token().balance(&ctx.recipient), 1000 + expected_total); // 1000 from id_completed earlier
+}
+
+/// Test that create_streams batch operation correctly handles the recipient index
+/// for multiple recipients and maintains sorted order across all recipients.
+/// This ensures the recipient index remains consistent under batch operations.
+#[test]
+fn test_create_streams_batch_recipient_index_consistency() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+
+    let recipient1 = Address::generate(&ctx.env);
+    let recipient2 = Address::generate(&ctx.env);
+    let recipient3 = Address::generate(&ctx.env);
+
+    // Create a batch with streams for different recipients
+    let params = soroban_sdk::Vec::from_array(
+        &ctx.env,
+        [
+            CreateStreamParams {
+                recipient: recipient1.clone(),
+                deposit_amount: 1000,
+                rate_per_second: 1,
+                start_time: 0,
+                cliff_time: 0,
+                end_time: 1000,
+            },
+            CreateStreamParams {
+                recipient: recipient2.clone(),
+                deposit_amount: 2000,
+                rate_per_second: 1,
+                start_time: 0,
+                cliff_time: 0,
+                end_time: 2000,
+            },
+            CreateStreamParams {
+                recipient: recipient1.clone(),
+                deposit_amount: 1500,
+                rate_per_second: 1,
+                start_time: 0,
+                cliff_time: 0,
+                end_time: 1500,
+            },
+            CreateStreamParams {
+                recipient: recipient3.clone(),
+                deposit_amount: 3000,
+                rate_per_second: 1,
+                start_time: 0,
+                cliff_time: 0,
+                end_time: 3000,
+            },
+            CreateStreamParams {
+                recipient: recipient2.clone(),
+                deposit_amount: 2500,
+                rate_per_second: 1,
+                start_time: 0,
+                cliff_time: 0,
+                end_time: 2500,
+            },
+        ],
+    );
+
+    let ids = ctx.client().create_streams(&ctx.sender, &params);
+    assert_eq!(ids.len(), 5);
+
+    // Verify recipient1 has streams 0 and 2 (sorted)
+    let streams1 = ctx.client().get_recipient_streams(&recipient1);
+    assert_eq!(streams1.len(), 2);
+    assert_eq!(streams1.get(0).unwrap(), 0);
+    assert_eq!(streams1.get(1).unwrap(), 2);
+    assert_eq!(ctx.client().get_recipient_stream_count(&recipient1), 2);
+
+    // Verify recipient2 has streams 1 and 4 (sorted)
+    let streams2 = ctx.client().get_recipient_streams(&recipient2);
+    assert_eq!(streams2.len(), 2);
+    assert_eq!(streams2.get(0).unwrap(), 1);
+    assert_eq!(streams2.get(1).unwrap(), 4);
+    assert_eq!(ctx.client().get_recipient_stream_count(&recipient2), 2);
+
+    // Verify recipient3 has stream 3
+    let streams3 = ctx.client().get_recipient_streams(&recipient3);
+    assert_eq!(streams3.len(), 1);
+    assert_eq!(streams3.get(0).unwrap(), 3);
+    assert_eq!(ctx.client().get_recipient_stream_count(&recipient3), 1);
+
+    // Now complete and close one stream from recipient1
+    ctx.env.ledger().set_timestamp(1000);
+    ctx.client().withdraw(&0);
+    ctx.client().close_completed_stream(&0);
+
+    // Verify recipient1 now only has stream 2
+    let streams1_after = ctx.client().get_recipient_streams(&recipient1);
+    assert_eq!(streams1_after.len(), 1);
+    assert_eq!(streams1_after.get(0).unwrap(), 2);
+    assert_eq!(ctx.client().get_recipient_stream_count(&recipient1), 1);
+
+    // Other recipients should be unchanged
+    let streams2_after = ctx.client().get_recipient_streams(&recipient2);
+    assert_eq!(streams2_after.len(), 2);
+    assert_eq!(streams2_after.get(0).unwrap(), 1);
+    assert_eq!(streams2_after.get(1).unwrap(), 4);
+
+    let streams3_after = ctx.client().get_recipient_streams(&recipient3);
+    assert_eq!(streams3_after.len(), 1);
+    assert_eq!(streams3_after.get(0).unwrap(), 3);
+
+    // Create another batch to verify IDs continue correctly
+    let params2 = soroban_sdk::Vec::from_array(
+        &ctx.env,
+        [
+            CreateStreamParams {
+                recipient: recipient1.clone(),
+                deposit_amount: 500,
+                rate_per_second: 1,
+                start_time: 0,
+                cliff_time: 0,
+                end_time: 500,
+            },
+        ],
+    );
+
+    let ids2 = ctx.client().create_streams(&ctx.sender, &params2);
+    assert_eq!(ids2.get(0).unwrap(), 5); // Next ID should be 5
+
+    // Verify recipient1 now has streams 2 and 5 (sorted)
+    let streams1_final = ctx.client().get_recipient_streams(&recipient1);
+    assert_eq!(streams1_final.len(), 2);
+    assert_eq!(streams1_final.get(0).unwrap(), 2);
+    assert_eq!(streams1_final.get(1).unwrap(), 5);
+    assert_eq!(ctx.client().get_recipient_stream_count(&recipient1), 2);
+}
 // ---------------------------------------------------------------------------
 // Tests — Overflow Protection (Issue: create_streams total deposit overflow)
 // ---------------------------------------------------------------------------
