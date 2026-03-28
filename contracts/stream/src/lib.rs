@@ -1782,8 +1782,6 @@ impl FluxoraStream {
         Ok(())
     }
 
-        Ok(())
-    }
 
     /// Retrieve the complete state of a payment stream.
     ///
