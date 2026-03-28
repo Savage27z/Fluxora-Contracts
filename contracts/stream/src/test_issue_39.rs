@@ -1,7 +1,7 @@
 #[cfg(test)]
 use crate::test::TestContext;
-use crate::{FluxoraStreamClient, StreamStatus};
-use soroban_sdk::{testutils::Address as _, testutils::Ledger, Address, Env};
+use crate::{StreamStatus};
+use soroban_sdk::{testutils::Address as _, testutils::Ledger, Address};
 
 #[test]
 fn test_withdraw_multiple_partial_withdrawals() {

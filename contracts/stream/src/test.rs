@@ -7,7 +7,7 @@ use soroban_sdk::{
 };
 
 use crate::{
-    Config, ContractError, ContractPauseChanged, CreateStreamParams, FluxoraStream,
+    ContractError, ContractPauseChanged, CreateStreamParams, FluxoraStream,
     FluxoraStreamClient, GlobalEmergencyPauseChanged, StreamCreated, StreamEndShortened,
     StreamEvent, StreamStatus, StreamToppedUp, WithdrawalTo,
 };
