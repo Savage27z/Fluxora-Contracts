@@ -933,7 +933,7 @@ impl FluxoraStream {
         let mut stream = load_stream(&env, stream_id)?;
         Self::require_stream_sender(&stream.sender);
         Self::cancel_stream_internal(&env, &mut stream)
-    }
+    } 
 
     /// Withdraw accrued tokens from a payment stream to the recipient.
     ///
