@@ -52,6 +52,5 @@ mod tests {
     #[test]
     fn checksum_module_compiles() {
         // This test exists to verify the module structure
-        assert!(1 + 1 == 2);
     }
 }

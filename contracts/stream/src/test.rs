@@ -15134,7 +15134,7 @@ fn test_batch_withdraw_mixed_stream_states_comprehensive() {
     assert_eq!(results.get(3).unwrap().amount, 1600);
 
     // Verify total tokens transferred
-    let expected_total = 800 + 500 + 0 + 1600;
+    let expected_total = 800 + 500 + 1600;
     assert_eq!(ctx.token().balance(&ctx.recipient), 1000 + expected_total); // 1000 from id_completed earlier
 }
 
