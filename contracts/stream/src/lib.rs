@@ -203,6 +203,7 @@ pub enum DataKey {
     RecipientStreams(Address), // Persistent storage for recipient stream index (sorted by stream_id).
     /// Emergency pause flag (bool). Appended to avoid shifting existing key discriminants.
     GlobalPaused,
+    GlobalEmergencyPaused,
 }
 
 // ---------------------------------------------------------------------------
@@ -2223,7 +2224,7 @@ impl FluxoraStream {
     /// # Events
     /// - Publishes topic `gl_pause` with [`GlobalEmergencyPauseChanged`] data.
     pub fn set_global_emergency_paused(env: Env, paused: bool) {
-        let admin = get_admin(&env);
+        let admin = get_admin(&env).unwrap();
         admin.require_auth();
 
         env.storage()

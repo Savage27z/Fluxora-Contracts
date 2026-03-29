@@ -14506,3 +14506,990 @@ fn test_create_streams_batch_deposit_overflow_is_atomic() {
         "stream count must not change on overflow failure"
     );
 }
+// =============================================================================
+// FILE: contracts/stream/src/test.rs  — ADDITIONS for cancel_stream_as_admin parity
+//
+// Add this entire block to the existing test.rs file.
+// All tests in this module are self-contained and use the existing TestContext.
+// =============================================================================
+
+// ---------------------------------------------------------------------------
+// Tests — cancel_stream_as_admin: operational cancel parity
+//
+// Issue scope: "cancel_stream_as_admin: operational cancel parity"
+//
+// This suite proves that cancel_stream_as_admin produces IDENTICAL externally
+// visible behavior to cancel_stream across every observable axis:
+//   - State fields (status, cancelled_at)
+//   - Refund amounts (deposit - accrued_at_cancel)
+//   - Accrued amount frozen at cancellation timestamp
+//   - Event topic and payload shape
+//   - Recipient can still withdraw accrued after admin cancel
+//
+// It also documents the ONE intentional difference:
+//   - cancel_stream is blocked during global emergency pause
+//   - cancel_stream_as_admin is NOT blocked (admin override)
+//
+// Authorization boundary:
+//   - Only the contract admin may call cancel_stream_as_admin
+//   - Sender, recipient, and third parties are rejected
+// ---------------------------------------------------------------------------
+
+// ── Parity: state transition ─────────────────────────────────────────────────
+
+/// Admin cancel on an Active stream transitions status to Cancelled
+/// and records cancelled_at — identical to the sender path.
+#[test]
+fn test_admin_cancel_parity_active_stream_status_transition() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream(); // Active, 0..1000, rate=1
+
+    ctx.env.ledger().set_timestamp(400);
+    ctx.client().cancel_stream_as_admin(&stream_id);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(
+        state.status,
+        StreamStatus::Cancelled,
+        "admin cancel must set status = Cancelled"
+    );
+    assert_eq!(
+        state.cancelled_at,
+        Some(400),
+        "admin cancel must record cancelled_at = ledger timestamp"
+    );
+    // All other fields must be unchanged
+    assert_eq!(state.deposit_amount, 1000);
+    assert_eq!(state.rate_per_second, 1);
+    assert_eq!(state.start_time, 0);
+    assert_eq!(state.end_time, 1000);
+    assert_eq!(state.withdrawn_amount, 0);
+}
+
+/// Admin cancel on a Paused stream transitions status to Cancelled — identical
+/// to the sender cancel path which also accepts Paused streams.
+#[test]
+fn test_admin_cancel_parity_paused_stream_status_transition() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(300);
+    ctx.client().pause_stream(&stream_id);
+
+    // Advance time while paused (accrual continues)
+    ctx.env.ledger().set_timestamp(500);
+    ctx.client().cancel_stream_as_admin(&stream_id);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Cancelled);
+    assert_eq!(
+        state.cancelled_at,
+        Some(500),
+        "cancelled_at must use current ledger time, not pause time"
+    );
+}
+
+// ── Parity: refund formula ───────────────────────────────────────────────────
+
+/// Admin cancel at t=0 (no accrual) → full refund to sender.
+/// Matches the sender path: test_cancel_stream_full_refund.
+#[test]
+fn test_admin_cancel_parity_full_refund_at_start() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream(); // deposit=1000
+
+    ctx.env.ledger().set_timestamp(0);
+    let sender_before = ctx.token().balance(&ctx.sender);
+    ctx.client().cancel_stream_as_admin(&stream_id);
+    let sender_after = ctx.token().balance(&ctx.sender);
+
+    assert_eq!(
+        sender_after - sender_before,
+        1000,
+        "admin cancel at t=0: sender must receive full deposit as refund"
+    );
+    assert_eq!(
+        ctx.token().balance(&ctx.contract_id),
+        0,
+        "contract must hold no tokens after full refund"
+    );
+}
+
+/// Admin cancel at t=300 (30% accrued) → sender receives 70% refund.
+/// Refund formula: deposit(1000) − accrued(300) = 700.
+#[test]
+fn test_admin_cancel_parity_partial_refund_at_30_percent() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(300);
+    let sender_before = ctx.token().balance(&ctx.sender);
+    ctx.client().cancel_stream_as_admin(&stream_id);
+    let sender_after = ctx.token().balance(&ctx.sender);
+
+    assert_eq!(
+        sender_after - sender_before,
+        700,
+        "admin cancel at t=300: refund must be deposit(1000) - accrued(300) = 700"
+    );
+    assert_eq!(
+        ctx.token().balance(&ctx.contract_id),
+        300,
+        "contract must hold accrued(300) for recipient to withdraw"
+    );
+}
+
+/// Admin cancel at t=500 (50% accrued) → 50/50 split.
+#[test]
+fn test_admin_cancel_parity_partial_refund_at_50_percent() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(500);
+    let sender_before = ctx.token().balance(&ctx.sender);
+    ctx.client().cancel_stream_as_admin(&stream_id);
+
+    assert_eq!(ctx.token().balance(&ctx.sender) - sender_before, 500);
+    assert_eq!(ctx.token().balance(&ctx.contract_id), 500);
+}
+
+/// Admin cancel at t=1000 (100% accrued) → zero refund to sender.
+/// Matches test_cancel_fully_accrued_no_refund on the sender path.
+#[test]
+fn test_admin_cancel_parity_zero_refund_at_end_time() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(1000);
+    let sender_before = ctx.token().balance(&ctx.sender);
+    ctx.client().cancel_stream_as_admin(&stream_id);
+    let sender_after = ctx.token().balance(&ctx.sender);
+
+    assert_eq!(
+        sender_after - sender_before,
+        0,
+        "admin cancel at end_time: sender receives no refund (fully accrued)"
+    );
+    assert_eq!(
+        ctx.token().balance(&ctx.contract_id),
+        1000,
+        "full deposit stays in contract for recipient"
+    );
+}
+
+/// Admin cancel past end_time → same as at end_time (accrual capped).
+#[test]
+fn test_admin_cancel_parity_zero_refund_past_end_time() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(5000); // well past end_time=1000
+    let sender_before = ctx.token().balance(&ctx.sender);
+    ctx.client().cancel_stream_as_admin(&stream_id);
+
+    assert_eq!(
+        ctx.token().balance(&ctx.sender) - sender_before,
+        0,
+        "accrual capped at deposit: admin cancel past end_time means zero refund"
+    );
+}
+
+// ── Parity: cliff interaction ────────────────────────────────────────────────
+
+/// Admin cancel before cliff → accrued=0 → full refund.
+/// Same as sender cancel before cliff.
+#[test]
+fn test_admin_cancel_parity_before_cliff_full_refund() {
+    let ctx = TestContext::setup();
+    // cliff at t=500
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &3000_i128,
+        &1_i128,
+        &0u64,
+        &500u64, // cliff
+        &3000u64,
+    );
+
+    ctx.env.ledger().set_timestamp(200); // before cliff
+    let sender_before = ctx.token().balance(&ctx.sender);
+    ctx.client().cancel_stream_as_admin(&stream_id);
+
+    let refund = ctx.token().balance(&ctx.sender) - sender_before;
+    assert_eq!(
+        refund, 3000,
+        "admin cancel before cliff: no accrual → full refund"
+    );
+    assert_eq!(
+        ctx.token().balance(&ctx.contract_id),
+        0,
+        "nothing held for recipient (no accrual before cliff)"
+    );
+
+    // Accrual is frozen at 0
+    let accrued = ctx.client().calculate_accrued(&stream_id);
+    assert_eq!(accrued, 0);
+}
+
+/// Admin cancel exactly at cliff → accrued = cliff_time - start_time.
+#[test]
+fn test_admin_cancel_parity_at_cliff_boundary() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,
+        &500u64,
+        &1000u64,
+    );
+
+    ctx.env.ledger().set_timestamp(500); // exactly at cliff
+    let sender_before = ctx.token().balance(&ctx.sender);
+    ctx.client().cancel_stream_as_admin(&stream_id);
+
+    let refund = ctx.token().balance(&ctx.sender) - sender_before;
+    assert_eq!(refund, 500, "at cliff: refund = deposit - accrued_at_cliff = 1000 - 500");
+    assert_eq!(ctx.token().balance(&ctx.contract_id), 500);
+}
+
+/// Admin cancel after cliff → partial refund, recipient can withdraw accrued.
+#[test]
+fn test_admin_cancel_parity_after_cliff_partial_refund() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,
+        &500u64, // cliff at 500
+        &1000u64,
+    );
+
+    ctx.env.ledger().set_timestamp(700); // after cliff
+    let sender_before = ctx.token().balance(&ctx.sender);
+    ctx.client().cancel_stream_as_admin(&stream_id);
+
+    let refund = ctx.token().balance(&ctx.sender) - sender_before;
+    assert_eq!(
+        refund, 300,
+        "admin cancel at t=700 after cliff=500: refund = 1000 - 700 = 300"
+    );
+
+    // Recipient can withdraw the frozen accrued amount
+    let withdrawn = ctx.client().withdraw(&stream_id);
+    assert_eq!(withdrawn, 700);
+}
+
+// ── Parity: invariant — refund + frozen_accrued == deposit ──────────────────
+
+/// Core invariant: for admin cancel, refund_to_sender + accrued_at_cancel
+/// always equals deposit_amount. Mirrors test_cancel_refund_plus_frozen_accrued_equals_deposit.
+#[test]
+fn test_admin_cancel_parity_refund_plus_accrued_equals_deposit() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream(); // deposit=1000, rate=1/s
+
+    ctx.env.ledger().set_timestamp(420);
+    let sender_before = ctx.token().balance(&ctx.sender);
+    ctx.client().cancel_stream_as_admin(&stream_id);
+    let sender_after = ctx.token().balance(&ctx.sender);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Cancelled);
+    assert_eq!(state.cancelled_at, Some(420));
+
+    // Advance time — frozen accrual must not change
+    ctx.env.ledger().set_timestamp(9_999);
+    let frozen_accrued = ctx.client().calculate_accrued(&stream_id);
+    let refund = sender_after - sender_before;
+
+    assert_eq!(refund, 580, "refund should be 1000 - 420");
+    assert_eq!(frozen_accrued, 420, "accrual frozen at cancellation time");
+    assert_eq!(
+        refund + frozen_accrued,
+        state.deposit_amount,
+        "refund + accrued must always equal deposit_amount"
+    );
+}
+
+// ── Parity: accrual frozen after admin cancel ────────────────────────────────
+
+/// After admin cancel, calculate_accrued must be frozen at cancelled_at
+/// regardless of how much time passes. Matches the sender path behavior.
+#[test]
+fn test_admin_cancel_parity_accrual_frozen_after_cancel() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(600);
+    ctx.client().cancel_stream_as_admin(&stream_id);
+
+    // Accrual at cancel time
+    let accrued_at_cancel = ctx.client().calculate_accrued(&stream_id);
+    assert_eq!(accrued_at_cancel, 600);
+
+    // Advance far into the future — must stay frozen
+    ctx.env.ledger().set_timestamp(99_999);
+    let accrued_later = ctx.client().calculate_accrued(&stream_id);
+    assert_eq!(
+        accrued_later,
+        accrued_at_cancel,
+        "accrual must remain frozen at cancelled_at after admin cancel"
+    );
+}
+
+// ── Parity: recipient can withdraw accrued after admin cancel ────────────────
+
+/// After admin cancel, the recipient must be able to withdraw the full
+/// accrued amount. This is identical behavior to the sender cancel path.
+#[test]
+fn test_admin_cancel_parity_recipient_can_withdraw_accrued() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream(); // 1000 tokens, rate=1/s
+
+    ctx.env.ledger().set_timestamp(400);
+    ctx.client().cancel_stream_as_admin(&stream_id);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Cancelled);
+    assert_eq!(state.withdrawn_amount, 0);
+
+    // Contract holds accrued amount for recipient
+    assert_eq!(ctx.token().balance(&ctx.contract_id), 400);
+    assert_eq!(ctx.token().balance(&ctx.recipient), 0);
+
+    // Recipient can withdraw the full accrued amount
+    let withdrawn = ctx.client().withdraw(&stream_id);
+    assert_eq!(withdrawn, 400, "recipient must be able to withdraw 400 accrued tokens");
+    assert_eq!(ctx.token().balance(&ctx.recipient), 400);
+    assert_eq!(ctx.token().balance(&ctx.contract_id), 0);
+}
+
+/// After admin cancel and partial withdrawal, recipient can withdraw the remainder.
+#[test]
+fn test_admin_cancel_parity_recipient_withdraw_after_partial_precancel_withdraw() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    // Recipient withdraws 200 before cancel
+    ctx.env.ledger().set_timestamp(300);
+    ctx.client().withdraw(&stream_id);
+
+    // Admin cancels at t=600 — accrued=600, already withdrawn=300
+    ctx.env.ledger().set_timestamp(600);
+    ctx.client().cancel_stream_as_admin(&stream_id);
+
+    // Recipient can withdraw remaining accrued (600 - 300 = 300)
+    let withdrawn = ctx.client().withdraw(&stream_id);
+    assert_eq!(withdrawn, 300);
+    assert_eq!(ctx.token().balance(&ctx.contract_id), 0);
+
+    // Status stays Cancelled (not Completed) — consistent with sender cancel path
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Cancelled);
+    assert_eq!(state.withdrawn_amount, 600);
+}
+
+/// After admin cancel, further withdraw when nothing remains returns 0.
+#[test]
+fn test_admin_cancel_parity_second_withdraw_returns_zero() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(500);
+    ctx.client().cancel_stream_as_admin(&stream_id);
+
+    // First withdraw drains the accrued
+    ctx.client().withdraw(&stream_id);
+
+    // Advance time (accrual is frozen, so nothing new to withdraw)
+    ctx.env.ledger().set_timestamp(9_999);
+    let second_withdraw = ctx.client().withdraw(&stream_id);
+    assert_eq!(
+        second_withdraw, 0,
+        "after admin cancel and full withdrawal, second withdraw must return 0"
+    );
+}
+
+// ── Parity: event shape ──────────────────────────────────────────────────────
+
+/// Admin cancel emits StreamCancelled(stream_id) — identical event shape to
+/// the sender cancel path. Indexers must not need to distinguish the caller
+/// from the event payload alone.
+#[test]
+fn test_admin_cancel_parity_emits_identical_event_shape() {
+    use soroban_sdk::testutils::Events;
+
+    let ctx = TestContext::setup();
+
+    // Cancel via sender path → record event shape
+    let stream_id_sender = ctx.create_default_stream();
+    ctx.env.ledger().set_timestamp(300);
+    ctx.client().cancel_stream(&stream_id_sender);
+    let events_sender = ctx.env.events().all();
+    let sender_event = events_sender
+        .iter()
+        .rev()
+        .find(|(_, _, data)| {
+            StreamEvent::try_from_val(&ctx.env, data)
+                .map(|e| e == StreamEvent::StreamCancelled(stream_id_sender))
+                .unwrap_or(false)
+        })
+        .expect("sender cancel must emit StreamCancelled event");
+
+    // Cancel via admin path → record event shape
+    let stream_id_admin = ctx.create_default_stream();
+    ctx.env.ledger().set_timestamp(300);
+    ctx.client().cancel_stream_as_admin(&stream_id_admin);
+    let events_admin = ctx.env.events().all();
+    let admin_event = events_admin
+        .iter()
+        .rev()
+        .find(|(_, _, data)| {
+            StreamEvent::try_from_val(&ctx.env, data)
+                .map(|e| e == StreamEvent::StreamCancelled(stream_id_admin))
+                .unwrap_or(false)
+        })
+        .expect("admin cancel must emit StreamCancelled event");
+
+    // Topics structure: (symbol_short!("cancelled"), stream_id)
+    // Both events must have the same topic layout (topics[0] = "cancelled")
+    assert_eq!(
+        sender_event.1.len(),
+        admin_event.1.len(),
+        "event topic vectors must have the same length"
+    );
+
+    // Payload type must be StreamCancelled in both cases
+    let sender_payload = StreamEvent::try_from_val(&ctx.env, &sender_event.2).unwrap();
+    let admin_payload = StreamEvent::try_from_val(&ctx.env, &admin_event.2).unwrap();
+    assert!(
+        matches!(sender_payload, StreamEvent::StreamCancelled(_)),
+        "sender path must emit StreamCancelled"
+    );
+    assert!(
+        matches!(admin_payload, StreamEvent::StreamCancelled(_)),
+        "admin path must emit StreamCancelled"
+    );
+}
+
+/// Admin cancel at specific timestamp emits correct event payload.
+#[test]
+fn test_admin_cancel_parity_cancel_event_payload() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+    ctx.env.ledger().set_timestamp(77);
+
+    ctx.client().cancel_stream_as_admin(&stream_id);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Cancelled);
+    assert_eq!(state.cancelled_at, Some(77));
+
+    let events = ctx.env.events().all();
+    let last_event = events.last().unwrap();
+    assert_eq!(
+        Option::<StreamEvent>::from_val(&ctx.env, &last_event.2).unwrap(),
+        StreamEvent::StreamCancelled(stream_id)
+    );
+}
+
+// ── Parity: Paused stream cancellation ──────────────────────────────────────
+
+/// Admin cancel on Paused stream uses CURRENT time (not pause time) for
+/// accrual calculation — identical to sender cancel on Paused stream.
+#[test]
+fn test_admin_cancel_parity_paused_stream_uses_current_time_for_accrual() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream(); // rate=1
+
+    // Pause at t=300
+    ctx.env.ledger().set_timestamp(300);
+    ctx.client().pause_stream(&stream_id);
+
+    // Advance time while paused (accrual continues)
+    ctx.env.ledger().set_timestamp(600);
+
+    let sender_before = ctx.token().balance(&ctx.sender);
+    ctx.client().cancel_stream_as_admin(&stream_id);
+    let sender_after = ctx.token().balance(&ctx.sender);
+
+    // Refund must use t=600 (current time), not t=300 (pause time)
+    let refund = sender_after - sender_before;
+    assert_eq!(
+        refund, 400,
+        "admin cancel on paused stream: refund = 1000 - 600 (current accrual) = 400"
+    );
+    assert_eq!(ctx.token().balance(&ctx.contract_id), 600);
+
+    let accrued = ctx.client().calculate_accrued(&stream_id);
+    assert_eq!(accrued, 600, "accrual frozen at t=600 (cancel time), not t=300 (pause time)");
+}
+
+
+// ── Authorization boundary ───────────────────────────────────────────────────
+
+/// Non-admin (recipient) cannot call cancel_stream_as_admin.
+#[test]
+#[should_panic]
+fn test_admin_cancel_auth_recipient_cannot_call_as_admin() {
+    let ctx = TestContext::setup_strict();
+
+    use soroban_sdk::{testutils::MockAuth, testutils::MockAuthInvoke, IntoVal};
+
+    // Create stream with sender auth
+    ctx.env.mock_auths(&[MockAuth {
+        address: &ctx.sender,
+        invoke: &MockAuthInvoke {
+            contract: &ctx.contract_id,
+            fn_name: "create_stream",
+            args: (
+                &ctx.sender, &ctx.recipient, 1000_i128, 1_i128, 0u64, 0u64, 1000u64,
+            ).into_val(&ctx.env),
+            sub_invokes: &[MockAuthInvoke {
+                contract: &ctx.token_id,
+                fn_name: "transfer",
+                args: (&ctx.sender, &ctx.contract_id, 1000_i128).into_val(&ctx.env),
+                sub_invokes: &[],
+            }],
+        },
+    }]);
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender, &ctx.recipient, &1000_i128, &1_i128, &0u64, &0u64, &1000u64,
+    );
+
+    // Recipient tries admin cancel — must be rejected
+    ctx.env.mock_auths(&[MockAuth {
+        address: &ctx.recipient,
+        invoke: &MockAuthInvoke {
+            contract: &ctx.contract_id,
+            fn_name: "cancel_stream_as_admin",
+            args: (stream_id,).into_val(&ctx.env),
+            sub_invokes: &[],
+        },
+    }]);
+    ctx.client().cancel_stream_as_admin(&stream_id);
+}
+
+/// Non-admin (sender) cannot call cancel_stream_as_admin.
+/// Sender must use cancel_stream instead.
+#[test]
+#[should_panic]
+fn test_admin_cancel_auth_sender_cannot_call_as_admin() {
+    let ctx = TestContext::setup_strict();
+
+    use soroban_sdk::{testutils::MockAuth, testutils::MockAuthInvoke, IntoVal};
+
+    ctx.env.mock_auths(&[MockAuth {
+        address: &ctx.sender,
+        invoke: &MockAuthInvoke {
+            contract: &ctx.contract_id,
+            fn_name: "create_stream",
+            args: (
+                &ctx.sender, &ctx.recipient, 1000_i128, 1_i128, 0u64, 0u64, 1000u64,
+            ).into_val(&ctx.env),
+            sub_invokes: &[MockAuthInvoke {
+                contract: &ctx.token_id,
+                fn_name: "transfer",
+                args: (&ctx.sender, &ctx.contract_id, 1000_i128).into_val(&ctx.env),
+                sub_invokes: &[],
+            }],
+        },
+    }]);
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender, &ctx.recipient, &1000_i128, &1_i128, &0u64, &0u64, &1000u64,
+    );
+
+    // Sender tries to call the admin entrypoint — must be rejected
+    ctx.env.mock_auths(&[MockAuth {
+        address: &ctx.sender,
+        invoke: &MockAuthInvoke {
+            contract: &ctx.contract_id,
+            fn_name: "cancel_stream_as_admin",
+            args: (stream_id,).into_val(&ctx.env),
+            sub_invokes: &[],
+        },
+    }]);
+    ctx.client().cancel_stream_as_admin(&stream_id);
+}
+
+/// Arbitrary third party cannot call cancel_stream_as_admin.
+#[test]
+#[should_panic]
+fn test_admin_cancel_auth_third_party_cannot_call_as_admin() {
+    let ctx = TestContext::setup_strict();
+
+    use soroban_sdk::{testutils::MockAuth, testutils::MockAuthInvoke, IntoVal};
+
+    ctx.env.mock_auths(&[MockAuth {
+        address: &ctx.sender,
+        invoke: &MockAuthInvoke {
+            contract: &ctx.contract_id,
+            fn_name: "create_stream",
+            args: (
+                &ctx.sender, &ctx.recipient, 1000_i128, 1_i128, 0u64, 0u64, 1000u64,
+            ).into_val(&ctx.env),
+            sub_invokes: &[MockAuthInvoke {
+                contract: &ctx.token_id,
+                fn_name: "transfer",
+                args: (&ctx.sender, &ctx.contract_id, 1000_i128).into_val(&ctx.env),
+                sub_invokes: &[],
+            }],
+        },
+    }]);
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender, &ctx.recipient, &1000_i128, &1_i128, &0u64, &0u64, &1000u64,
+    );
+
+    let attacker = Address::generate(&ctx.env);
+    ctx.env.mock_auths(&[MockAuth {
+        address: &attacker,
+        invoke: &MockAuthInvoke {
+            contract: &ctx.contract_id,
+            fn_name: "cancel_stream_as_admin",
+            args: (stream_id,).into_val(&ctx.env),
+            sub_invokes: &[],
+        },
+    }]);
+    ctx.client().cancel_stream_as_admin(&stream_id);
+}
+
+/// The contract admin CAN call cancel_stream_as_admin on any stream.
+/// This positive test covers strict-mode auth verification.
+#[test]
+fn test_admin_cancel_auth_admin_succeeds_strict() {
+    let ctx = TestContext::setup_strict();
+
+    use soroban_sdk::{testutils::MockAuth, testutils::MockAuthInvoke, IntoVal};
+
+    ctx.env.mock_auths(&[MockAuth {
+        address: &ctx.sender,
+        invoke: &MockAuthInvoke {
+            contract: &ctx.contract_id,
+            fn_name: "create_stream",
+            args: (
+                &ctx.sender, &ctx.recipient, 1000_i128, 1_i128, 0u64, 0u64, 1000u64,
+            ).into_val(&ctx.env),
+            sub_invokes: &[MockAuthInvoke {
+                contract: &ctx.token_id,
+                fn_name: "transfer",
+                args: (&ctx.sender, &ctx.contract_id, 1000_i128).into_val(&ctx.env),
+                sub_invokes: &[],
+            }],
+        },
+    }]);
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender, &ctx.recipient, &1000_i128, &1_i128, &0u64, &0u64, &1000u64,
+    );
+
+    ctx.env.mock_auths(&[MockAuth {
+        address: &ctx.admin,
+        invoke: &MockAuthInvoke {
+            contract: &ctx.contract_id,
+            fn_name: "cancel_stream_as_admin",
+            args: (stream_id,).into_val(&ctx.env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    ctx.client().cancel_stream_as_admin(&stream_id);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Cancelled);
+}
+
+// ── Terminal state rejection ─────────────────────────────────────────────────
+
+/// Admin cannot cancel a Completed stream.
+#[test]
+#[should_panic]
+fn test_admin_cancel_rejects_completed_stream() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(1000);
+    ctx.client().withdraw(&stream_id); // drives to Completed
+
+    assert_eq!(
+        ctx.client().get_stream_state(&stream_id).status,
+        StreamStatus::Completed
+    );
+
+    ctx.client().cancel_stream_as_admin(&stream_id);
+}
+
+/// Admin cannot cancel an already-Cancelled stream.
+#[test]
+#[should_panic]
+fn test_admin_cancel_rejects_already_cancelled_stream() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.client().cancel_stream_as_admin(&stream_id); // first cancel
+
+    // Second cancel must panic
+    ctx.client().cancel_stream_as_admin(&stream_id);
+}
+
+/// Cancelling via sender path and then admin path on the same stream panics.
+#[test]
+#[should_panic]
+fn test_admin_cancel_rejects_stream_already_cancelled_by_sender() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.client().cancel_stream(&stream_id); // sender cancels first
+    ctx.client().cancel_stream_as_admin(&stream_id); // admin tries again — must panic
+}
+
+/// Admin cancel on non-existent stream returns StreamNotFound.
+#[test]
+fn test_admin_cancel_stream_not_found_returns_error() {
+    let ctx = TestContext::setup();
+    let result = ctx.client().try_cancel_stream_as_admin(&9999);
+    assert_eq!(
+        result,
+        Err(Ok(ContractError::StreamNotFound)),
+        "admin cancel on non-existent stream must return StreamNotFound"
+    );
+}
+
+// ── Intentional difference: global emergency pause bypass ────────────────────
+//
+// This is the ONE documented difference between cancel_stream and
+// cancel_stream_as_admin. Tests below verify the pause matrix:
+//
+// | Caller         | Global pause | Outcome                   |
+// |----------------|--------------|---------------------------|
+// | sender         | false        | Succeeds                  |
+// | sender         | true         | Blocked (ContractPaused)  |
+// | admin          | false        | Succeeds                  |
+// | admin          | true         | Succeeds (bypass)         |
+
+/// When globally paused, the sender cancel is BLOCKED.
+#[test]
+fn test_pause_matrix_sender_cancel_blocked_when_paused() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.client().set_global_emergency_paused(&true);
+
+    let result = ctx.client().try_cancel_stream(&stream_id);
+    assert!(
+        result.is_err(),
+        "sender cancel must be blocked when global emergency pause is active"
+    );
+
+    // Stream must be unchanged
+    assert_eq!(
+        ctx.client().get_stream_state(&stream_id).status,
+        StreamStatus::Active
+    );
+}
+
+/// When globally paused, the admin cancel SUCCEEDS (bypass).
+/// This is the critical parity *difference* — admin operators must always
+/// be able to intervene, even during an emergency pause.
+#[test]
+fn test_pause_matrix_admin_cancel_succeeds_when_paused() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.client().set_global_emergency_paused(&true);
+
+    // Admin cancel must not be blocked
+    ctx.client().cancel_stream_as_admin(&stream_id);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(
+        state.status,
+        StreamStatus::Cancelled,
+        "admin cancel must succeed even when global emergency pause is active"
+    );
+}
+
+/// Sender cancel succeeds when pause is NOT active (sanity check).
+#[test]
+fn test_pause_matrix_sender_cancel_succeeds_when_not_paused() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    // No pause active
+    ctx.client().cancel_stream(&stream_id);
+    assert_eq!(
+        ctx.client().get_stream_state(&stream_id).status,
+        StreamStatus::Cancelled
+    );
+}
+
+/// Admin cancel unpauses the contract then re-pauses: both cancel operations
+/// work correctly through the pause toggle cycle.
+#[test]
+fn test_pause_matrix_admin_cancel_works_before_and_after_pause_toggle() {
+    let ctx = TestContext::setup();
+
+    // Cancel while NOT paused
+    let id_a = ctx.create_default_stream();
+    ctx.client().cancel_stream_as_admin(&id_a);
+    assert_eq!(
+        ctx.client().get_stream_state(&id_a).status,
+        StreamStatus::Cancelled
+    );
+
+    // Activate pause
+    ctx.client().set_global_emergency_paused(&true);
+
+    // Cancel while paused — admin bypass must still work
+    let id_b = ctx.create_default_stream();
+    ctx.client().cancel_stream_as_admin(&id_b);
+    assert_eq!(
+        ctx.client().get_stream_state(&id_b).status,
+        StreamStatus::Cancelled
+    );
+
+    // Deactivate pause
+    ctx.client().set_global_emergency_paused(&false);
+
+    // Cancel again after unpause
+    let id_c = ctx.create_default_stream();
+    ctx.client().cancel_stream_as_admin(&id_c);
+    assert_eq!(
+        ctx.client().get_stream_state(&id_c).status,
+        StreamStatus::Cancelled
+    );
+}
+
+// ── CEI ordering / no side effects on auth failure ───────────────────────────
+
+/// A failed admin cancel (wrong caller) must have zero side effects:
+/// no state change, no token movement, no events.
+#[test]
+fn test_admin_cancel_failed_auth_has_no_side_effects() {
+    let ctx = TestContext::setup_strict();
+
+    use soroban_sdk::{testutils::MockAuth, testutils::MockAuthInvoke, IntoVal};
+
+    ctx.env.mock_auths(&[MockAuth {
+        address: &ctx.sender,
+        invoke: &MockAuthInvoke {
+            contract: &ctx.contract_id,
+            fn_name: "create_stream",
+            args: (
+                &ctx.sender, &ctx.recipient, 1000_i128, 1_i128, 0u64, 0u64, 1000u64,
+            ).into_val(&ctx.env),
+            sub_invokes: &[MockAuthInvoke {
+                contract: &ctx.token_id,
+                fn_name: "transfer",
+                args: (&ctx.sender, &ctx.contract_id, 1000_i128).into_val(&ctx.env),
+                sub_invokes: &[],
+            }],
+        },
+    }]);
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender, &ctx.recipient, &1000_i128, &1_i128, &0u64, &0u64, &1000u64,
+    );
+
+    let state_before = ctx.client().get_stream_state(&stream_id);
+    let sender_balance_before = ctx.token().balance(&ctx.sender);
+    let contract_balance_before = ctx.token().balance(&ctx.contract_id);
+    let events_before = ctx.env.events().all().len();
+
+    // Attacker tries to call with wrong auth
+    let attacker = Address::generate(&ctx.env);
+    ctx.env.mock_auths(&[MockAuth {
+        address: &attacker,
+        invoke: &MockAuthInvoke {
+            contract: &ctx.contract_id,
+            fn_name: "cancel_stream_as_admin",
+            args: (stream_id,).into_val(&ctx.env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ctx.client().cancel_stream_as_admin(&stream_id);
+    }));
+    assert!(result.is_err(), "wrong auth must be rejected");
+
+    // Zero side effects
+    let state_after = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state_after.status, state_before.status);
+    assert_eq!(state_after.cancelled_at, state_before.cancelled_at);
+    assert_eq!(state_after.withdrawn_amount, state_before.withdrawn_amount);
+    assert_eq!(ctx.token().balance(&ctx.sender), sender_balance_before);
+    assert_eq!(ctx.token().balance(&ctx.contract_id), contract_balance_before);
+    assert_eq!(ctx.env.events().all().len(), events_before);
+}
+
+// ── Balance conservation invariant ──────────────────────────────────────────
+
+/// Token conservation: total supply is unchanged after admin cancel + recipient withdrawal.
+#[test]
+fn test_admin_cancel_parity_token_conservation() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    let total_before = ctx.token().balance(&ctx.sender)
+        + ctx.token().balance(&ctx.recipient)
+        + ctx.token().balance(&ctx.contract_id);
+
+    ctx.env.ledger().set_timestamp(350);
+    ctx.client().cancel_stream_as_admin(&stream_id);
+
+    let total_after_cancel = ctx.token().balance(&ctx.sender)
+        + ctx.token().balance(&ctx.recipient)
+        + ctx.token().balance(&ctx.contract_id);
+    assert_eq!(total_before, total_after_cancel, "tokens must be conserved after admin cancel");
+
+    ctx.client().withdraw(&stream_id);
+
+    let total_after_withdraw = ctx.token().balance(&ctx.sender)
+        + ctx.token().balance(&ctx.recipient)
+        + ctx.token().balance(&ctx.contract_id);
+    assert_eq!(total_before, total_after_withdraw, "tokens must be conserved after recipient withdrawal");
+}
+
+// ── Multi-stream: admin can cancel any stream regardless of sender ────────────
+
+/// Admin can cancel streams from different senders.
+/// Verifies there is no per-sender restriction on the admin path.
+#[test]
+fn test_admin_cancel_parity_works_on_any_stream_regardless_of_sender() {
+    let ctx = TestContext::setup();
+
+    let sender2 = Address::generate(&ctx.env);
+    let recipient2 = Address::generate(&ctx.env);
+    ctx.sac.mint(&sender2, &5000_i128);
+
+    ctx.env.ledger().set_timestamp(0);
+
+    let id_from_sender1 = ctx.create_default_stream();
+    let id_from_sender2 = ctx.client().create_stream(
+        &sender2, &recipient2, &1000_i128, &1_i128, &0u64, &0u64, &1000u64,
+    );
+
+    // Admin cancels both — must work regardless of who created the stream
+    ctx.client().cancel_stream_as_admin(&id_from_sender1);
+    ctx.client().cancel_stream_as_admin(&id_from_sender2);
+
+    assert_eq!(
+        ctx.client().get_stream_state(&id_from_sender1).status,
+        StreamStatus::Cancelled
+    );
+    assert_eq!(
+        ctx.client().get_stream_state(&id_from_sender2).status,
+        StreamStatus::Cancelled
+    );
+}
