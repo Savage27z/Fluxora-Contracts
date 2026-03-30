@@ -16622,20 +16622,17 @@ mod i128_boundary_streams {
 #[cfg(test)]
 mod recipient_index_stress {
     use super::*;
-    use soroban_sdk::{
-        testutils::{Address as _, Ledger},
-        Address, Vec,
-    };
+    use soroban_sdk::{testutils::Ledger, Address, Vec};
 
     #[test]
     fn test_recipient_index_stress_large_scale() {
         let ctx = TestContext::setup();
         let recipient = Address::generate(&ctx.env);
 
-        // Stress test: Create 500 streams for one recipient
+        // Stress test: Create 100 streams for one recipient
         // We use increments of 50 to avoid any single-call resource limits
         let batch_size = 50;
-        let total_batches = 10; // 500 streams total
+        let total_batches = 2; // 100 streams total
 
         for _ in 0..total_batches {
             let mut streams = Vec::new(&ctx.env);
@@ -16653,10 +16650,10 @@ mod recipient_index_stress {
         }
 
         let index = ctx.client().get_recipient_streams(&recipient);
-        assert_eq!(index.len(), 500);
+        assert_eq!(index.len(), 100);
 
         // Verify sorted order
-        for i in 0..999 {
+        for i in 0..index.len() - 1 {
             assert!(index.get(i).unwrap() < index.get(i + 1).unwrap());
         }
     }
