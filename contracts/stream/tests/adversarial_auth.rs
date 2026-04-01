@@ -1376,6 +1376,7 @@ fn adversarial_extend_end_time_recipient_rejected() {
                 &0u64,
                 &0u64,
                 &1000u64,
+>>>>>>> upstream/main
             )
                 .into_val(&ctx.env),
             sub_invokes: &[MockAuthInvoke {

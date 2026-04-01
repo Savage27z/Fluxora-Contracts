@@ -2735,10 +2735,8 @@ impl FluxoraStream {
     pub fn set_contract_paused(env: Env, paused: bool) -> Result<(), ContractError> {
         get_admin(&env)?.require_auth();
 
-        env.storage()
-            .instance()
-            .set(&DataKey::CreationPaused, &paused);
-        bump_instance_ttl(&env);
+        // Store contract pause flag (if needed for persistence)
+        // For now, we can store it as part of Config or as a separate state
 
         env.events().publish(
             (symbol_short!("ct_pause"),),

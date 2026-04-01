@@ -18,22 +18,31 @@
 //!    (the `testutils` feature is only for `#[cfg(test)]`).
 //! 5. **No environment-dependent code** is compiled into the WASM artifact.
 //!
-//! If any of these invariants change, the reference checksum must be regenerated.
+//! If any of these invariants change, the reference checksum in
+//! `wasm/checksums.sha256` must be regenerated via
+//! `script/update-wasm-checksums.sh`.
 //!
 //! # CI verification flow
 //!
 //! 1. CI builds the WASM artifact with the pinned toolchain.
 //! 2. CI computes `sha256sum` of the built WASM.
-//! 3. CI compares the computed hash against the reference.
-//! 4. If the hashes differ, CI fails with an actionable error message.
+//! 3. CI compares the computed hash against `wasm/checksums.sha256`.
+//! 4. If the hashes differ, CI fails with an actionable error message
+//!    directing the developer to regenerate the checksums.
 //!
 //! # Residual risks
 //!
 //! - **Optimized WASM**: The Stellar CLI `optimize` step may produce
 //!   non-deterministic output depending on the CLI version. The reference
-//!   checksum covers only the raw (unoptimized) WASM.
+//!   checksum covers only the raw (unoptimized) WASM, which is deterministic
+//!   given the pinned toolchain and dependencies.
 //! - **Dependency resolution**: `Cargo.lock` must be committed and unchanged.
-//! - **Host toolchain differences**: The host OS and architecture should be deterministic.
+//!   If a transitive dependency publishes a new patch version, `cargo build`
+//!   will still use the locked version.
+//! - **Host toolchain differences**: The CI runs on `ubuntu-latest`. Building
+//!   on a different OS or architecture may produce different output for
+//!   non-WASM targets, but the `wasm32-unknown-unknown` target is
+//!   cross-compilation and should be deterministic across hosts.
 
 #[cfg(test)]
 mod tests {

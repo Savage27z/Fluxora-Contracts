@@ -16806,9 +16806,6 @@ mod i128_boundary_streams {
     #[test]
     fn near_max_deposit_two_partial_withdrawals_complete_stream() {
         // Use rate=1 and a round deposit to avoid integer division truncation
-    #[test]
-    fn near_max_deposit_two_partial_withdrawals_complete_stream() {
-        // Use rate=1 and a round deposit to avoid integer division truncation
         let large_deposit: i128 = i128::MAX / 1_000_000 / 1_000 * 1_000; // divisible by 1000
         let rate: i128 = large_deposit / 1_000;
         let duration: u64 = 1_000;
