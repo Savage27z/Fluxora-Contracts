@@ -269,6 +269,33 @@ pub struct CreateStreamParams {
     pub end_time: u64,
 }
 
+/// Parameters for creating a payment stream with relative (offset-based) times.
+///
+/// Computes `start_time`, `cliff_time`, and `end_time` by adding offsets to the
+/// current ledger timestamp (`env.ledger().timestamp()`). This eliminates off-chain
+/// calculation errors that lead to `StartTimeInPast` failures.
+///
+/// # Time offsets
+/// - `start_delay`: Seconds to add to current timestamp for stream start
+/// - `cliff_delay`: Seconds to add to current timestamp for cliff time (must be >= start_delay)
+/// - `duration`: Total duration of stream in seconds (end_time = start_time + duration)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreateStreamRelativeParams {
+    /// Address that will receive streamed tokens for this stream entry.
+    pub recipient: Address,
+    /// Total amount escrowed for this stream entry.
+    pub deposit_amount: i128,
+    /// Streaming speed in tokens per second for this stream entry.
+    pub rate_per_second: i128,
+    /// Delay (in seconds) before stream accrual starts, relative to current timestamp.
+    pub start_delay: u64,
+    /// Delay (in seconds) before withdrawals are allowed, relative to current timestamp.
+    pub cliff_delay: u64,
+    /// Total duration the stream runs (in seconds) from start_time to end_time.
+    pub duration: u64,
+}
+
 /// Namespace for all contract storage keys.
 ///
 /// # Evolution policy
@@ -857,6 +884,105 @@ impl FluxoraStream {
         ))
     }
 
+    /// Create a new payment stream with relative (offset-based) timing.
+    ///
+    /// Computes absolute timestamps by adding delays to the current ledger timestamp,
+    /// eliminating off-chain calculation errors that cause `StartTimeInPast` failures.
+    /// Internally delegates to `create_stream` with computed absolute times.
+    ///
+    /// # Parameters
+    /// - `sender`: Address funding and authorizing the stream
+    /// - `recipient`: Address receiving streamed tokens
+    /// - `deposit_amount`: Total amount escrowed for the stream
+    /// - `rate_per_second`: Streaming speed in tokens per second
+    /// - `start_delay`: Seconds until stream starts (relative to current timestamp)
+    /// - `cliff_delay`: Seconds until cliff time (relative to current timestamp)
+    /// - `duration`: Total duration stream runs (in seconds)
+    ///
+    /// # Computation
+    /// Uses `current_time = env.ledger().timestamp()`:
+    /// - `start_time = current_time + start_delay`
+    /// - `cliff_time = current_time + cliff_delay`
+    /// - `end_time = start_time + duration`
+    ///
+    /// # Returns
+    /// - `u64`: Unique stream ID
+    ///
+    /// # Authorization
+    /// - Requires authorization from `sender`
+    ///
+    /// # Success Semantics
+    /// - All validation invariants from `create_stream` are preserved
+    /// - Batch `create_streams_relative` can use this via parameter conversion
+    /// - Contract paused state is checked (blocks creation if paused)
+    ///
+    /// # Failure Semantics
+    /// - `StartTimeInPast`: Never occurs (times are always relative to current)
+    /// - `InvalidParams`: If delays/duration cause arithmetic overflow or invalid constraints
+    /// - `ContractPaused`: If creation is globally paused
+    /// - Other errors inherited from `create_stream` validation
+    ///
+    /// # Errors
+    /// Delegates to `create_stream`; see its documentation for full error list.
+    ///
+    /// # Panics
+    /// - If `start_delay + current_time` overflows `u64` (arithmetic overflow)
+    /// - If token transfer fails
+    ///
+    /// # Security Notes
+    /// - Relative timing removes the need for precise off-chain clock synchronization
+    /// - All deposit and rate validation proceeds as-is; relative delays do not bypass checks
+    /// - Self-streaming (`sender == recipient`) is still rejected by `create_stream`
+    ///
+    /// # Example
+    /// ```
+    /// // Create a stream starting in 2 days, cliff in 5 days, running for 30 days
+    /// let stream_id = contract.create_stream_relative(
+    ///     &sender,
+    ///     &recipient,
+    ///     &100_000_000,        // 100M tokens
+    ///     &1_157_407,           // ~1% per day at 86400s/day
+    ///     &(2 * 86400),         // 2 days delay
+    ///     &(5 * 86400),         // 5 days cliff
+    ///     &(30 * 86400),        // 30 days duration
+    /// )?;
+    /// ```
+    pub fn create_stream_relative(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        deposit_amount: i128,
+        rate_per_second: i128,
+        start_delay: u64,
+        cliff_delay: u64,
+        duration: u64,
+    ) -> Result<u64, ContractError> {
+        let current_time = env.ledger().timestamp();
+
+        // Compute absolute times with overflow checks
+        let start_time = current_time
+            .checked_add(start_delay)
+            .ok_or(ContractError::InvalidParams)?;
+        let cliff_time = current_time
+            .checked_add(cliff_delay)
+            .ok_or(ContractError::InvalidParams)?;
+        let end_time = start_time
+            .checked_add(duration)
+            .ok_or(ContractError::InvalidParams)?;
+
+        // Delegate to standard create_stream with computed absolute times
+        Self::create_stream(
+            env,
+            sender,
+            recipient,
+            deposit_amount,
+            rate_per_second,
+            start_time,
+            cliff_time,
+            end_time,
+        )
+    }
+
     /// Create multiple payment streams in a single transaction.
     ///
     /// Optimizes gas usage by authorizing once and doing a single bulk token transfer
@@ -1038,6 +1164,109 @@ impl FluxoraStream {
         }
 
         Ok(created_ids)
+    }
+
+    /// Create multiple payment streams with relative (offset-based) timing.
+    ///
+    /// Batch version of `create_stream_relative` that converts relative time offsets
+    /// to absolute timestamps and delegates to `create_streams`. Provides the same
+    /// atomicity and gas efficiency as `create_streams` while eliminating off-chain
+    /// timestamp calculation errors.
+    ///
+    /// # Parameters
+    /// - `sender`: Address funding all streams in the batch
+    /// - `streams_relative`: Vector of `CreateStreamRelativeParams` with relative time offsets
+    ///
+    /// # Returns
+    /// - `Vec<u64>`: Stream IDs in the same order as `streams_relative` input entries
+    ///
+    /// # Authorization
+    /// - Requires authorization from `sender` exactly once for the entire batch
+    ///
+    /// # Time Computation
+    /// Uses `current_time = env.ledger().timestamp()`:
+    /// For each entry:
+    /// - `start_time = current_time + start_delay`
+    /// - `cliff_time = current_time + cliff_delay`
+    /// - `end_time = start_time + duration`
+    ///
+    /// # Success Semantics
+    /// - Empty batch returns `Ok(Vec::new())` without side effects
+    /// - All validation invariants from `create_streams` are preserved
+    /// - Relative timing eliminates `StartTimeInPast` errors
+    /// - Single token transfer for all streams (atomic)
+    ///
+    /// # Failure Semantics
+    /// - Any entry's time offset causes arithmetic overflow → `InvalidParams`
+    /// - Any validation failure → entire batch fails atomically
+    /// - Any token transfer failure → no state change
+    /// - No events emitted on failure
+    ///
+    /// # Security Notes
+    /// - Relative timing removes need for off-chain clock synchronization
+    /// - All deposit, rate, and deposit-coverage validation proceeds as-is
+    /// - Self-streaming still rejected per entry
+    ///
+    /// # Example
+    /// ```ignore
+    /// let params = vec![
+    ///     CreateStreamRelativeParams {
+    ///         recipient: alice,
+    ///         deposit_amount: 1000,
+    ///         rate_per_second: 1,
+    ///         start_delay: 86400,      // 1 day
+    ///         cliff_delay: 259200,     // 3 days
+    ///         duration: 2592000,       // 30 days
+    ///     },
+    ///     CreateStreamRelativeParams {
+    ///         recipient: bob,
+    ///         deposit_amount: 2000,
+    ///         rate_per_second: 2,
+    ///         start_delay: 0,          // Immediate
+    ///         cliff_delay: 0,          // Immediate
+    ///         duration: 2592000,       // 30 days
+    ///     },
+    /// ];
+    /// let ids = contract.create_streams_relative(&sender, &params)?;
+    /// // ids = [0, 1] (assuming first batch)
+    /// ```
+    pub fn create_streams_relative(
+        env: Env,
+        sender: Address,
+        streams_relative: soroban_sdk::Vec<CreateStreamRelativeParams>,
+    ) -> Result<soroban_sdk::Vec<u64>, ContractError> {
+        if streams_relative.is_empty() {
+            return Ok(soroban_sdk::Vec::new(&env));
+        }
+
+        let current_time = env.ledger().timestamp();
+        let mut absolute_streams = soroban_sdk::Vec::new(&env);
+
+        // Convert relative parameters to absolute times
+        for rel_params in streams_relative.iter() {
+            let start_time = current_time
+                .checked_add(rel_params.start_delay)
+                .ok_or(ContractError::InvalidParams)?;
+            let cliff_time = current_time
+                .checked_add(rel_params.cliff_delay)
+                .ok_or(ContractError::InvalidParams)?;
+            let end_time = start_time
+                .checked_add(rel_params.duration)
+                .ok_or(ContractError::InvalidParams)?;
+
+            let absolute_params = CreateStreamParams {
+                recipient: rel_params.recipient,
+                deposit_amount: rel_params.deposit_amount,
+                rate_per_second: rel_params.rate_per_second,
+                start_time,
+                cliff_time,
+                end_time,
+            };
+            absolute_streams.push_back(absolute_params);
+        }
+
+        // Delegate to standard create_streams with converted absolute times
+        Self::create_streams(env, sender, absolute_streams)
     }
 
     /// Pause an active payment stream.

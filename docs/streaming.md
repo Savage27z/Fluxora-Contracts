@@ -337,6 +337,118 @@ On failure (`InvalidParams` or `InvalidState`):
 - Rationale: Accrual math (in `accrual.rs`) is already overflow-safe via `checked_mul` and clamping.
 - Application-specific limits should be handled in the frontend or factory contracts.
 
+### Relative-Time Helpers: `create_stream_relative` and `create_streams_relative`
+
+The contract provides convenience entry points that compute stream times relative to the current ledger timestamp, eliminating off-chain calculation errors that lead to `StartTimeInPast` failures.
+
+#### Motivation
+
+Off-chain applications often construct stream parameters ahead of time, e.g., "start 1 day from now". If there is clock drift between the application server and the Soroban ledger, the calculated `start_time` may already be in the past when the transaction is executed, causing `StartTimeInPast` rejection.
+
+Relative-time helpers avoid this by deferring timestamp computation to the contract itself, which always has the authoritative ledger timestamp.
+
+#### `create_stream_relative`
+
+**Signature:**
+```rust
+pub fn create_stream_relative(
+    env: Env,
+    sender: Address,
+    recipient: Address,
+    deposit_amount: i128,
+    rate_per_second: i128,
+    start_delay: u64,     // Seconds to add to current timestamp
+    cliff_delay: u64,     // Seconds to add to current timestamp
+    duration: u64,        // Total seconds from start_time to end_time
+) -> Result<u64, ContractError>
+```
+
+**Computation:**
+```
+current_time = env.ledger().timestamp()
+start_time   = current_time + start_delay
+cliff_time   = current_time + cliff_delay
+end_time     = start_time + duration
+```
+
+**Validation:**
+- Checks for overflow/underflow in all additions
+- Delegates to `create_stream` with computed absolute times
+- Inherits all validation rules: deposit sufficiency, cliff bounds, etc.
+- **Never produces `StartTimeInPast`** error (computed times are always >= current_time)
+
+**Example:**
+```
+// Create a stream starting in 1 day, cliff in 3 days, running for 30 days
+contract.create_stream_relative(
+    &sender,
+    &recipient,
+    &100_000_000,           // 100M tokens
+    &1_157_407,             // ~1% per day
+    &86400,                 // start_delay: 1 day
+    &259200,                // cliff_delay: 3 days
+    &2_592_000,             // duration: 30 days
+)?;
+```
+
+#### `create_streams_relative`
+
+**Signature:**
+```rust
+pub fn create_streams_relative(
+    env: Env,
+    sender: Address,
+    streams_relative: Vec<CreateStreamRelativeParams>,
+) -> Result<Vec<u64>, ContractError>
+```
+
+**Parameters (per entry):**
+```rust
+pub struct CreateStreamRelativeParams {
+    pub recipient: Address,
+    pub deposit_amount: i128,
+    pub rate_per_second: i128,
+    pub start_delay: u64,
+    pub cliff_delay: u64,
+    pub duration: u64,
+}
+```
+
+**Batch semantics:**
+- Empty batch returns `Ok(Vec::new())` with no side effects
+- All entries are converted to absolute times (overflow checks per entry)
+- Delegates to `create_streams` with converted parameters
+- Atomic: all or nothing (any validation failure aborts entire batch)
+- Single authorization and token transfer for all streams (gas efficient)
+
+**Example:**
+```
+let params = vec![
+    CreateStreamRelativeParams {
+        recipient: alice,
+        deposit_amount: 1000,
+        rate_per_second: 1,
+        start_delay: 0,           // Immediate
+        cliff_delay: 0,           // Immediate
+        duration: 86400,          // 1 day
+    },
+    CreateStreamRelativeParams {
+        recipient: bob,
+        deposit_amount: 2000,
+        rate_per_second: 2,
+        start_delay: 86400,       // 1 day delay
+        cliff_delay: 172800,      // 2 day cliff
+        duration: 2592000,        // 30 days
+    },
+];
+contract.create_streams_relative(&sender, &params)?;
+```
+
+**Error handling:**
+- `InvalidParams`: If any time offset causes u64 overflow, or if other validation fails (rate, deposit, cliff bounds, etc.)
+- `ContractPaused`: If creation is globally paused
+- All other errors: Same as `create_stream` / `create_streams`
+
 ---
 
 ## 4. Access Control
@@ -346,6 +458,8 @@ On failure (`InvalidParams` or `InvalidState`):
 | `init`                    | Bootstrap admin signer (once) | `admin.require_auth()`                      |
 | `create_stream`           | Sender                        | `sender.require_auth()`                     |
 | `create_streams`          | Sender                        | `sender.require_auth()` (once per batch)    |
+| `create_stream_relative`  | Sender                        | `sender.require_auth()`                     |
+| `create_streams_relative` | Sender                        | `sender.require_auth()` (once per batch)    |
 | `pause_stream`            | Sender                        | `sender.require_auth()`                     |
 | `resume_stream`           | Sender                        | `sender.require_auth()`                     |
 | `cancel_stream`           | Sender                        | `sender.require_auth()`                     |
