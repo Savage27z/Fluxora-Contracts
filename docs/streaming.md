@@ -41,6 +41,7 @@ No hidden rules or implementation details are required to understand protocol be
 | **Cancellation** | `cancel_stream` / `cancel_stream_as_admin`    | Refunds unstreamed amount; frozen accrued stays for recipient         |
 | **Withdrawal**   | `withdraw` / `withdraw_to` / `batch_withdraw` | Recipient pulls accrued tokens; allowed on Paused if past `end_time`  |
 | **Completion**   | Automatic                                     | When `withdrawn_amount == deposit_amount`, status becomes `Completed` |
+| **Auto-claim**   | `set_auto_claim` / `revoke_auto_claim` / `trigger_auto_claim` | Recipient opts in to permissionless final claim at `end_time` to a chosen destination |
 
 ### State Transitions
 
@@ -365,6 +366,10 @@ On failure (`InvalidParams` or `InvalidState`):
 | `update_rate_per_second`  | Sender                        | `sender.require_auth()`                     |
 | `shorten_stream_end_time` | Sender                        | `sender.require_auth()`                     |
 | `extend_stream_end_time`  | Sender                        | `sender.require_auth()`                     |
+| `set_auto_claim`          | Recipient                     | `recipient.require_auth()`                  |
+| `revoke_auto_claim`       | Recipient                     | `recipient.require_auth()`                  |
+| `trigger_auto_claim`      | Anyone                        | None (permissionless; destination fixed by recipient) |
+| `get_auto_claim_destination` | Anyone                     | None (view)                                 |
 
 **Note:** Sender-managed functions (`pause_stream`, `resume_stream`, `cancel_stream`) require sender auth. Admin uses separate `_as_admin` entry points.
 
@@ -522,6 +527,56 @@ When `stream_ids` is an empty vector:
 - Empty batch is a valid no-op: allows callers to submit conditional batches without special-casing
 - Authorization is still required: maintains consistent auth semantics across all entry points
 - Idempotent: enables safe retry logic in integrators
+
+---
+
+### Auto-claim Opt-in Semantics
+
+`set_auto_claim`, `revoke_auto_claim`, and `trigger_auto_claim` implement a recipient-controlled permissionless claim mechanism.
+
+#### Overview
+
+Recipients may opt in to have their final withdrawal triggered by any third party (keeper, bot, or user) once the stream reaches `end_time`. The destination address is chosen and stored on-chain by the recipient — no caller can redirect funds.
+
+#### `set_auto_claim(stream_id, destination)`
+
+- **Auth**: `recipient.require_auth()` — only the stream recipient may set or change the destination.
+- **Constraints**: stream must exist and not be `Completed` or `Cancelled`; `destination` must not be the contract address.
+- **Idempotent**: calling again with a new address overwrites the previous destination.
+- **Event**: `("ac_set", stream_id)` → `AutoClaimSet { stream_id, destination }`.
+
+#### `revoke_auto_claim(stream_id)`
+
+- **Auth**: `recipient.require_auth()`.
+- **Idempotent**: safe to call even if no destination is set (no error, no event side-effects beyond the revoke event).
+- **Event**: `("ac_revoke", stream_id)` → `AutoClaimRevoked { stream_id }`.
+
+#### `trigger_auto_claim(stream_id)`
+
+- **Auth**: **none** — permissionless. Any account may call this.
+- **Preconditions** (all must hold):
+  1. Stream exists.
+  2. Stream is not `Completed` or `Cancelled`.
+  3. `ledger.timestamp() >= stream.end_time` (time-terminal).
+  4. Auto-claim destination is set (`AutoClaimNotSet` otherwise).
+  5. Contract is not globally paused.
+- **Accounting**: identical to `withdraw_to` — computes `accrued - withdrawn_amount`, caps by contract balance, updates `withdrawn_amount`, may transition to `Completed`.
+- **Destination immutability**: tokens are sent to the address stored by the recipient. The caller cannot influence the destination.
+- **Events**:
+  - `("withdrew", stream_id)` → `Withdrawal { stream_id, recipient, amount }` (indexer compatibility).
+  - `("ac_trig", stream_id)` → `AutoClaimTriggered { stream_id, destination, amount }`.
+  - `("completed", stream_id)` → `StreamEvent::StreamCompleted(stream_id)` if stream transitions to `Completed`.
+
+#### Cancellation interaction
+
+If a stream is cancelled after opt-in, `trigger_auto_claim` returns `InvalidState`. The auto-claim destination entry remains in storage but is inert. Recipients may call `revoke_auto_claim` to clean up storage.
+
+#### Security invariants
+
+1. Only the recipient can set or change the destination (`require_auth` enforced).
+2. The caller of `trigger_auto_claim` has zero influence over where tokens go.
+3. CEI ordering is preserved: stream state is saved before the token transfer.
+4. Global emergency pause blocks `trigger_auto_claim` (same as `withdraw`).
 
 ---
 

@@ -18,6 +18,8 @@ pub enum DataKey {
     Stream(u64),               // discriminant 2 — persistent
     RecipientStreams(Address), // discriminant 3 — persistent
     GlobalPaused,              // discriminant 4 — instance
+    CreationPaused,            // discriminant 5 — instance
+    AutoClaimDestination(u64), // discriminant 6 — persistent
 }
 ```
 
@@ -30,6 +32,8 @@ pub enum DataKey {
 | 2 | `Stream(u64)` | Persistent | `Stream` struct | `create_stream`, `create_streams` | `pause_stream`, `resume_stream`, `cancel_stream`, `withdraw`, `withdraw_to`, `batch_withdraw`, `top_up_stream`, `update_rate_per_second`, `shorten_stream_end_time`, `extend_stream_end_time` |
 | 3 | `RecipientStreams(Address)` | Persistent | `Vec<u64>` (sorted) | `create_stream`, `create_streams` | `close_completed_stream` (removes entry) |
 | 4 | `GlobalPaused` | Instance | `bool` | `set_contract_paused` | `set_contract_paused` |
+| 5 | `CreationPaused` | Instance | `bool` | `set_contract_paused` | `set_contract_paused` |
+| 6 | `AutoClaimDestination(u64)` | Persistent | `Address` | `set_auto_claim` | `revoke_auto_claim` (removes entry) |
 
 ---
 
@@ -85,6 +89,7 @@ Used for per-stream data and per-recipient indexes. Grows linearly with stream c
 |---|---|
 | `Stream(stream_id)` | Complete stream state: participants, amounts, timing, status, `cancelled_at`. One entry per stream. |
 | `RecipientStreams(address)` | Sorted `Vec<u64>` of stream IDs where `address` is the recipient. Maintained in ascending order. |
+| `AutoClaimDestination(stream_id)` | Recipient-chosen destination `Address` for permissionless auto-claim. Absent when not opted in. Removed by `revoke_auto_claim`. |
 
 ---
 
@@ -158,6 +163,9 @@ Extended on every `load_stream()` (read) and `save_stream()` (write), and on eve
 | `close_completed_stream` | Removes `Stream(id)`, updates `RecipientStreams(addr)` | Permissionless cleanup |
 | `set_admin` | `Config` | Admin key rotation |
 | `set_contract_paused` | `GlobalPaused` | Emergency pause flag |
+| `set_auto_claim` | `AutoClaimDestination(stream_id)` | Stores recipient-chosen destination |
+| `revoke_auto_claim` | Removes `AutoClaimDestination(stream_id)` | Clears auto-claim opt-in |
+| `trigger_auto_claim` | `Stream(id)` | Updates `withdrawn_amount`; may set `status=Completed` |
 
 ---
 
