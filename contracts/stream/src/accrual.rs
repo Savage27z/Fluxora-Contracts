@@ -92,7 +92,10 @@ pub fn calculate_accrued_amount_checkpointed(
         None => deposit_amount,
     };
 
-    checkpointed_amount.saturating_add(added).min(deposit_amount).max(0)
+    checkpointed_amount
+        .saturating_add(added)
+        .min(deposit_amount)
+        .max(0)
 }
 
 #[cfg(test)]

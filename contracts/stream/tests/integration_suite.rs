@@ -3522,7 +3522,10 @@ fn decrease_rate_basic_refund_and_accrual_preserved() {
     // New deposit = 5000 + 5*(2000-500) = 5000 + 7500 = 12500; refund = 20000-12500 = 7500
     assert_eq!(state.deposit_amount, 12_500);
     let refund = ctx.token.balance(&ctx.sender) - sender_before;
-    assert_eq!(refund, 7_500, "sender must receive refund of unreachable deposit");
+    assert_eq!(
+        refund, 7_500,
+        "sender must receive refund of unreachable deposit"
+    );
 }
 
 // ---------------------------------------------------------------------------
