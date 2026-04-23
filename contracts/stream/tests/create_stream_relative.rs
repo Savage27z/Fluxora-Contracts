@@ -9,6 +9,7 @@ use soroban_sdk::{
     vec, Address, Env,
 };
 
+#[allow(dead_code)]
 struct TestContext<'a> {
     env: Env,
     contract_id: Address,
@@ -292,7 +293,7 @@ fn create_streams_relative_single_entry() {
     let params = vec![
         &ctx.env,
         CreateStreamRelativeParams {
-            recipient: ctx.recipient,
+            recipient: ctx.recipient.clone(),
             deposit_amount: 1000,
             rate_per_second: 1,
             start_delay: 100,
@@ -321,7 +322,7 @@ fn create_streams_relative_multiple_entries_sequential_ids() {
     let params = vec![
         &ctx.env,
         CreateStreamRelativeParams {
-            recipient: ctx.recipient,
+            recipient: ctx.recipient.clone(),
             deposit_amount: 1000,
             rate_per_second: 1,
             start_delay: 0,
@@ -329,7 +330,7 @@ fn create_streams_relative_multiple_entries_sequential_ids() {
             duration: 1000,
         },
         CreateStreamRelativeParams {
-            recipient: recipient2,
+            recipient: recipient2.clone(),
             deposit_amount: 2000,
             rate_per_second: 2,
             start_delay: 100,
@@ -384,7 +385,7 @@ fn create_streams_relative_invalid_entry_fails_atomically() {
     let params = vec![
         &ctx.env,
         CreateStreamRelativeParams {
-            recipient: ctx.recipient,
+            recipient: ctx.recipient.clone(),
             deposit_amount: 1000,
             rate_per_second: 1,
             start_delay: 0,
@@ -392,7 +393,7 @@ fn create_streams_relative_invalid_entry_fails_atomically() {
             duration: 1000,
         },
         CreateStreamRelativeParams {
-            recipient: recipient2,
+            recipient: recipient2.clone(),
             deposit_amount: 500,
             rate_per_second: 2,
             start_delay: 0,
