@@ -2881,3 +2881,188 @@ fn integration_create_streams_single_token_pull_equals_sum() {
     assert_eq!(ctx.token.balance(&ctx.sender), sender_before - 3500);
     assert_eq!(ctx.token.balance(&ctx.contract_id), 3500);
 }
+
+// ===========================================================================
+// Integration tests — sweep_excess (liability-based accounting)
+// ===========================================================================
+
+/// No excess: contract holds exactly the liabilities → sweep returns 0.
+#[test]
+fn sweep_excess_returns_zero_when_no_excess() {
+    let ctx = TestContext::setup();
+    ctx.create_default_stream(); // deposits 1000, liabilities = 1000
+
+    let swept = ctx.client().sweep_excess(&ctx.admin);
+    assert_eq!(swept, 0);
+    assert_eq!(ctx.token.balance(&ctx.contract_id), 1000);
+}
+
+/// Accidental direct deposit: sweep recovers only the excess, leaves liabilities.
+#[test]
+fn sweep_excess_recovers_accidental_deposit() {
+    let ctx = TestContext::setup();
+    ctx.create_default_stream(); // liabilities = 1000, balance = 1000
+
+    // Simulate accidental direct transfer of 500 tokens to the contract.
+    let sac = StellarAssetClient::new(&ctx.env, &ctx.token_id);
+    sac.mint(&ctx.contract_id, &500_i128);
+    assert_eq!(ctx.token.balance(&ctx.contract_id), 1500);
+
+    let admin_before = ctx.token.balance(&ctx.admin);
+    let swept = ctx.client().sweep_excess(&ctx.admin);
+
+    assert_eq!(swept, 500);
+    assert_eq!(ctx.token.balance(&ctx.admin), admin_before + 500);
+    // Liabilities (1000) remain untouched.
+    assert_eq!(ctx.token.balance(&ctx.contract_id), 1000);
+    assert_eq!(ctx.client().get_total_liabilities(), 1000);
+}
+
+/// Active stream: sweep cannot touch funds owed to recipient.
+#[test]
+fn sweep_excess_cannot_steal_active_stream_funds() {
+    let ctx = TestContext::setup();
+    ctx.create_default_stream(); // 1000 tokens locked, liabilities = 1000
+
+    // No excess → sweep returns 0 and contract balance is unchanged.
+    let swept = ctx.client().sweep_excess(&ctx.admin);
+    assert_eq!(swept, 0);
+    assert_eq!(ctx.token.balance(&ctx.contract_id), 1000);
+}
+
+/// Cancelled stream with unwithdrawn accrued: sweep cannot touch accrued funds.
+#[test]
+fn sweep_excess_cannot_steal_cancelled_stream_accrued() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream(); // 1000 tokens, rate=1, end=1000
+
+    // Cancel at t=600: 600 accrued (owed to recipient), 400 refunded to sender.
+    ctx.env.ledger().set_timestamp(600);
+    ctx.client().cancel_stream(&stream_id);
+
+    // Contract holds 600 (accrued, owed to recipient). Liabilities = 600.
+    assert_eq!(ctx.token.balance(&ctx.contract_id), 600);
+    assert_eq!(ctx.client().get_total_liabilities(), 600);
+
+    // No excess → sweep returns 0.
+    let swept = ctx.client().sweep_excess(&ctx.admin);
+    assert_eq!(swept, 0);
+    assert_eq!(ctx.token.balance(&ctx.contract_id), 600);
+
+    // Recipient can still withdraw their 600.
+    let withdrawn = ctx.client().withdraw(&stream_id);
+    assert_eq!(withdrawn, 600);
+    assert_eq!(ctx.token.balance(&ctx.contract_id), 0);
+    assert_eq!(ctx.client().get_total_liabilities(), 0);
+}
+
+/// Completed stream awaiting close: after full withdrawal liabilities = 0, excess = 0.
+#[test]
+fn sweep_excess_after_completed_stream_is_zero() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(1000);
+    ctx.client().withdraw(&stream_id);
+
+    assert_eq!(ctx.token.balance(&ctx.contract_id), 0);
+    assert_eq!(ctx.client().get_total_liabilities(), 0);
+
+    let swept = ctx.client().sweep_excess(&ctx.admin);
+    assert_eq!(swept, 0);
+}
+
+/// Multiple active streams + accidental deposit: only excess is swept.
+#[test]
+fn sweep_excess_multiple_streams_only_excess_swept() {
+    let ctx = TestContext::setup();
+    let sac = StellarAssetClient::new(&ctx.env, &ctx.token_id);
+    sac.mint(&ctx.sender, &5000_i128);
+
+    ctx.env.ledger().set_timestamp(0);
+    // Create two streams: 1000 + 2000 = 3000 total liabilities.
+    ctx.client().create_stream(
+        &ctx.sender, &ctx.recipient, &1000_i128, &1_i128, &0u64, &0u64, &1000u64,
+    );
+    ctx.client().create_stream(
+        &ctx.sender, &ctx.recipient, &2000_i128, &2_i128, &0u64, &0u64, &1000u64,
+    );
+
+    assert_eq!(ctx.client().get_total_liabilities(), 3000);
+    assert_eq!(ctx.token.balance(&ctx.contract_id), 3000);
+
+    // Accidental deposit of 777.
+    sac.mint(&ctx.contract_id, &777_i128);
+    assert_eq!(ctx.token.balance(&ctx.contract_id), 3777);
+
+    let swept = ctx.client().sweep_excess(&ctx.admin);
+    assert_eq!(swept, 777);
+    assert_eq!(ctx.token.balance(&ctx.contract_id), 3000);
+    assert_eq!(ctx.client().get_total_liabilities(), 3000);
+}
+
+/// Sweep is admin-only: non-admin call must be rejected.
+#[test]
+fn sweep_excess_requires_admin_auth() {
+    let ctx = TestContext::setup();
+    let sac = StellarAssetClient::new(&ctx.env, &ctx.token_id);
+    sac.mint(&ctx.contract_id, &100_i128);
+
+    // Use setup_strict so we can test auth rejection.
+    let ctx2 = TestContext::setup_strict();
+    let sac2 = StellarAssetClient::new(&ctx2.env, &ctx2.token_id);
+    sac2.mint(&ctx2.contract_id, &100_i128);
+
+    let attacker = Address::generate(&ctx2.env);
+    ctx2.env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &attacker,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &ctx2.contract_id,
+            fn_name: "sweep_excess",
+            args: (attacker.clone(),).into_val(&ctx2.env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ctx2.client().sweep_excess(&attacker);
+    }));
+    assert!(result.is_err(), "non-admin sweep must be rejected");
+    // Contract balance unchanged.
+    assert_eq!(ctx2.token.balance(&ctx2.contract_id), 100);
+}
+
+/// top_up then sweep: top-up increases liabilities, so no excess is created.
+#[test]
+fn sweep_excess_after_top_up_is_zero() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream(); // liabilities = 1000
+
+    ctx.client().top_up_stream(&stream_id, &ctx.sender, &500_i128);
+    // liabilities = 1500, balance = 1500
+    assert_eq!(ctx.client().get_total_liabilities(), 1500);
+    assert_eq!(ctx.token.balance(&ctx.contract_id), 1500);
+
+    let swept = ctx.client().sweep_excess(&ctx.admin);
+    assert_eq!(swept, 0);
+}
+
+/// shorten_stream_end_time reduces liabilities; no excess created.
+#[test]
+fn sweep_excess_after_shorten_is_zero() {
+    let ctx = TestContext::setup();
+    // deposit=2000, rate=1, end=1000 → can shorten to 500
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender, &ctx.recipient, &2000_i128, &1_i128, &0u64, &0u64, &1000u64,
+    );
+    // liabilities = 2000, balance = 2000
+
+    ctx.client().shorten_stream_end_time(&stream_id, &500u64);
+    // new deposit = 500, refund = 1500 → liabilities = 500, balance = 500
+    assert_eq!(ctx.client().get_total_liabilities(), 500);
+    assert_eq!(ctx.token.balance(&ctx.contract_id), 500);
+
+    let swept = ctx.client().sweep_excess(&ctx.admin);
+    assert_eq!(swept, 0);
+}

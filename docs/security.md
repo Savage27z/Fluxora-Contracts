@@ -151,3 +151,53 @@ The contract employs exhaustive arithmetic safety checks across all fund-related
 - **Accrual Capping**: Per-second accrual math implicitly caps at the `deposit_amount` on multiplication overflow, ensuring that technical overflows cannot be exploited to drain the contract beyond its funded limits.
 This prevents unauthorized bootstrap and prevents later repointing to a different token
 address or replacing the admin through `init`.
+
+---
+
+## Excess-token recovery (`sweep_excess`)
+
+### Invariant
+
+```
+sweepable = balance(contract_address) - total_liabilities
+```
+
+`total_liabilities` is a running counter stored in instance storage under
+`DataKey::TotalLiabilities`. It tracks the maximum tokens the contract could
+ever owe to recipients at any point in time:
+
+| Event | Effect on `TotalLiabilities` |
+|---|---|
+| `create_stream` / `create_streams` | `+= deposit_amount` |
+| `top_up_stream` | `+= amount` |
+| `cancel_stream` (refund path) | `-= refund_amount` (unstreamed portion) |
+| `shorten_stream_end_time` (refund path) | `-= refund_amount` |
+| `withdraw` / `withdraw_to` / `batch_withdraw` | `-= withdrawable` |
+
+The counter is never decremented below zero (saturates at 0 on underflow).
+
+### Why this is safe
+
+`sweep_excess` computes `excess = max(0, balance - liabilities)` and transfers
+that amount to the admin-supplied `to` address. Because `liabilities` accounts
+for every token that could be claimed by a recipient, the sweep can never remove
+funds owed to anyone — even if streams are active, paused, or cancelled with
+unwithdrawn accrued amounts.
+
+### Authorization
+
+`sweep_excess` requires `admin.require_auth()`. Non-admin callers are rejected.
+
+### When `sweepable > 0`
+
+The only way `balance > liabilities` is if tokens were sent directly to the
+contract address outside of `create_stream` / `top_up_stream` (i.e. an
+accidental direct transfer). Normal protocol operation keeps `balance == liabilities`.
+
+### Audit checklist
+
+- Every code path that increases the contract's token balance must also increase
+  `TotalLiabilities` by the same amount.
+- Every code path that decreases the contract's token balance must also decrease
+  `TotalLiabilities` by the same amount.
+- `sweep_excess` must never transfer more than `balance - liabilities`.

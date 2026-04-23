@@ -161,6 +161,14 @@ pub struct GlobalEmergencyPauseChanged {
     pub paused: bool,
 }
 
+/// Emitted when the admin sweeps excess tokens from the contract.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ExcessSwept {
+    pub to: Address,
+    pub amount: i128,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Stream {
@@ -203,6 +211,10 @@ pub enum DataKey {
     RecipientStreams(Address), // Persistent storage for recipient stream index (sorted by stream_id).
     /// Emergency pause flag (bool). Appended to avoid shifting existing key discriminants.
     GlobalPaused,
+    /// Running sum of tokens owed to recipients (instance storage).
+    /// Invariant: TotalLiabilities == sum of (deposit_amount - withdrawn_amount) for all
+    /// Active/Paused streams, plus (accrued_at_cancel - withdrawn_amount) for Cancelled streams.
+    TotalLiabilities,
 }
 
 // ---------------------------------------------------------------------------
@@ -270,6 +282,19 @@ fn read_global_paused(env: &Env) -> bool {
         .instance()
         .get(&DataKey::GlobalPaused)
         .unwrap_or(false)
+}
+
+fn read_total_liabilities(env: &Env) -> i128 {
+    env.storage()
+        .instance()
+        .get(&DataKey::TotalLiabilities)
+        .unwrap_or(0i128)
+}
+
+fn write_total_liabilities(env: &Env, amount: i128) {
+    env.storage()
+        .instance()
+        .set(&DataKey::TotalLiabilities, &amount);
 }
 
 fn load_stream(env: &Env, stream_id: u64) -> Result<Stream, ContractError> {
@@ -496,6 +521,12 @@ impl FluxoraStream {
 
         // Add stream to recipient's index (maintains sorted order by stream_id)
         add_stream_to_recipient_index(env, &recipient, stream_id);
+
+        // Track liability: the full deposit is owed to the recipient until withdrawn/refunded.
+        let liabilities = read_total_liabilities(env)
+            .checked_add(deposit_amount)
+            .unwrap_or(i128::MAX);
+        write_total_liabilities(env, liabilities);
 
         env.events().publish(
             (symbol_short!("created"), stream_id),
@@ -1025,6 +1056,12 @@ impl FluxoraStream {
         }
         save_stream(&env, &stream);
 
+        // Reduce liabilities as tokens leave the contract to the recipient.
+        let liabilities = read_total_liabilities(&env)
+            .checked_sub(withdrawable)
+            .unwrap_or(0);
+        write_total_liabilities(&env, liabilities);
+
         push_token(&env, &stream.recipient, withdrawable)?;
 
         env.events().publish(
@@ -1138,6 +1175,12 @@ impl FluxoraStream {
         }
         save_stream(&env, &stream);
 
+        // Reduce liabilities as tokens leave the contract.
+        let liabilities = read_total_liabilities(&env)
+            .checked_sub(withdrawable)
+            .unwrap_or(0);
+        write_total_liabilities(&env, liabilities);
+
         push_token(&env, &destination, withdrawable)?;
 
         env.events().publish(
@@ -1239,6 +1282,12 @@ impl FluxoraStream {
                     stream.status = StreamStatus::Completed;
                 }
                 save_stream(&env, &stream);
+
+                // Reduce liabilities as tokens leave the contract.
+                let liabilities = read_total_liabilities(&env)
+                    .checked_sub(withdrawable)
+                    .unwrap_or(0);
+                write_total_liabilities(&env, liabilities);
 
                 push_token(&env, &stream.recipient, withdrawable)?;
 
@@ -1717,6 +1766,11 @@ impl FluxoraStream {
         save_stream(&env, &stream);
 
         if refund_amount > 0 {
+            // Reduce liabilities by the refunded portion (no longer owed to recipient).
+            let liabilities = read_total_liabilities(&env)
+                .checked_sub(refund_amount)
+                .unwrap_or(0);
+            write_total_liabilities(&env, liabilities);
             push_token(&env, &stream.sender, refund_amount)?;
         }
 
@@ -1873,6 +1927,12 @@ impl FluxoraStream {
 
         // External token pull happens AFTER state is persisted (CEI-compliant).
         pull_token(&env, &funder, amount)?;
+
+        // Increase liabilities to match the additional deposit.
+        let liabilities = read_total_liabilities(&env)
+            .checked_add(amount)
+            .unwrap_or(i128::MAX);
+        write_total_liabilities(&env, liabilities);
 
         env.events().publish(
             (symbol_short!("top_up"), stream_id),
@@ -2062,7 +2122,13 @@ impl FluxoraStream {
         stream.cancelled_at = Some(now);
         save_stream(env, stream);
 
+        // Reduce liabilities by the refunded (unstreamed) portion.
+        // The accrued portion remains a liability until the recipient withdraws.
         if refund_amount > 0 {
+            let liabilities = read_total_liabilities(env)
+                .checked_sub(refund_amount)
+                .unwrap_or(0);
+            write_total_liabilities(env, liabilities);
             push_token(env, &stream.sender, refund_amount)?;
         }
 
@@ -2235,6 +2301,58 @@ impl FluxoraStream {
             (symbol_short!("gl_pause"),),
             GlobalEmergencyPauseChanged { paused },
         );
+    }
+
+    /// Return the current total liabilities (tokens owed to recipients).
+    ///
+    /// This is a read-only view of the running `TotalLiabilities` counter.
+    /// The sweepable amount is `token_balance(contract) - get_total_liabilities()`.
+    pub fn get_total_liabilities(env: Env) -> i128 {
+        bump_instance_ttl(&env);
+        read_total_liabilities(&env)
+    }
+
+    /// Sweep accidentally deposited tokens to `to`, leaving liabilities intact.
+    ///
+    /// Transfers `balance(contract) - total_liabilities` tokens to `to`.
+    /// This can only be positive when tokens were sent directly to the contract
+    /// address outside of `create_stream` / `top_up_stream` (i.e. accidental
+    /// deposits). It can never remove tokens that are owed to recipients.
+    ///
+    /// # Authorization
+    /// - Requires authorization from the contract admin.
+    ///
+    /// # Returns
+    /// - `i128`: The amount swept (0 if nothing to sweep).
+    ///
+    /// # Errors
+    /// - `ContractError::InvalidState` if the contract is not initialized.
+    ///
+    /// # Events
+    /// - Publishes `("swept", to)` → `ExcessSwept { to, amount }` when `amount > 0`.
+    pub fn sweep_excess(env: Env, to: Address) -> Result<i128, ContractError> {
+        let config = get_config(&env)?;
+        config.admin.require_auth();
+
+        let token_client = token::Client::new(&env, &config.token);
+        let balance = token_client.balance(&env.current_contract_address());
+        let liabilities = read_total_liabilities(&env);
+
+        // sweepable = balance - liabilities; saturate at 0 (never negative).
+        let excess = (balance - liabilities).max(0);
+        if excess == 0 {
+            return Ok(0);
+        }
+
+        push_token(&env, &to, excess)?;
+
+        env.events()
+            .publish((symbol_short!("swept"), to.clone()), ExcessSwept {
+                to,
+                amount: excess,
+            });
+
+        Ok(excess)
     }
 }
 

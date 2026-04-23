@@ -421,3 +421,51 @@ errors relevant to stream creation and timing.
 ## Error Reference
 
 For a full list of contract errors, see [error.md](./error.md).
+
+---
+
+## 7. Excess-Token Recovery (`sweep_excess`)
+
+### Overview
+
+`sweep_excess(to)` is an admin-only entrypoint that recovers tokens accidentally
+sent directly to the contract address. It can never remove tokens owed to
+recipients.
+
+### Invariant
+
+```
+sweepable = balance(contract_address) - total_liabilities
+```
+
+`total_liabilities` is a running counter (instance storage, `DataKey::TotalLiabilities`)
+that tracks the maximum tokens the contract could owe to recipients:
+
+| Operation | Change to `TotalLiabilities` |
+|---|---|
+| `create_stream` / `create_streams` | `+= deposit_amount` |
+| `top_up_stream` | `+= amount` |
+| `cancel_stream` (refund) | `-= refund_amount` |
+| `shorten_stream_end_time` (refund) | `-= refund_amount` |
+| `withdraw` / `withdraw_to` / `batch_withdraw` | `-= withdrawable` |
+
+### Entrypoints
+
+| Entrypoint | Auth | Returns |
+|---|---|---|
+| `sweep_excess(to)` | Admin | `i128` — amount swept (0 if nothing to sweep) |
+| `get_total_liabilities()` | Anyone (view) | `i128` — current liabilities counter |
+
+### Events
+
+| Topic | Payload | When |
+|---|---|---|
+| `("swept", to)` | `ExcessSwept { to, amount }` | `sweep_excess` when `amount > 0` |
+
+### Safety guarantees
+
+- `sweep_excess` saturates at 0: if `balance < liabilities` (should not happen in
+  normal operation), it returns 0 and transfers nothing.
+- Admin cannot sweep funds owed to recipients, even for active, paused, or
+  cancelled streams with unwithdrawn accrued amounts.
+- The counter is updated atomically with every token movement (CEI-compliant).
