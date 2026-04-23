@@ -679,7 +679,7 @@ fn remove_stream_from_recipient_index(env: &Env, recipient: &Address, stream_id:
 fn pull_token(env: &Env, from: &Address, amount: i128) -> Result<(), ContractError> {
     let token_address = get_token(env)?;
     let token_client = token::Client::new(env, &token_address);
-    token_client.transfer(from, &env.current_contract_address(), &amount);
+    token_client.transfer_from(&env.current_contract_address(), from, &env.current_contract_address(), &amount);
     Ok(())
 }
 

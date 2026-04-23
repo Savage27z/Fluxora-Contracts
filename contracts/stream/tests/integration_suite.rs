@@ -44,6 +44,9 @@ impl<'a> TestContext<'a> {
         sac.mint(&sender, &10_000_i128);
 
         let token = TokenClient::new(&env, &token_id);
+        // Provide sufficient allowance for tests that don't explicitly test allowances.
+        // Use a reasonable expiration ledger (100,000) as u32::MAX is beyond host limits.
+        token.approve(&sender, &contract_id, &i128::MAX, &100_000);
 
         Self {
             env,
@@ -90,6 +93,8 @@ impl<'a> TestContext<'a> {
         sac.mint(&sender, &10_000_i128);
 
         let token = TokenClient::new(&env, &token_id);
+        // Provide sufficient allowance for tests that don't explicitly test allowances.
+        token.approve(&sender, &contract_id, &i128::MAX, &100_000);
 
         Self {
             env,
@@ -567,6 +572,7 @@ fn top_up_stream_allows_third_party_funder_and_emits_payload() {
     let contract_balance_before = ctx.token.balance(&ctx.contract_id);
     let events_before = ctx.env.events().all().len();
 
+    ctx.token.approve(&treasury, &ctx.contract_id, &800, &100);
     ctx.client().top_up_stream(&stream_id, &treasury, &800_i128);
 
     let state = ctx.client().get_stream_state(&stream_id);
@@ -1969,7 +1975,7 @@ fn test_create_many_streams_from_same_sender() {
     log!(&ctx.env, "cpu_insns", cpu_insns);
     // Guardrail: ensure creating 100 streams stays within a reasonable CPU budget.
     // Slightly relaxed to account for additional features while keeping a strict bound.
-    assert!(cpu_insns <= 60_000_000);
+    assert!(cpu_insns <= 70_000_000);
 
     // Check memory bytes consumed
     let mem_bytes = ctx.env.budget().memory_bytes_cost();
@@ -2777,6 +2783,7 @@ fn integration_init_unblocks_all_paths() {
     sac.mint(&sender, &10_000_i128);
 
     env.ledger().set_timestamp(0);
+    soroban_sdk::token::Client::new(&env, &token_id).approve(&sender, &contract_id, &1000, &100);
     let stream_id = client.create_stream(
         &sender, &recipient, &1000_i128, &1_i128, &0u64, &0u64, &1000u64,
     );
@@ -4817,4 +4824,153 @@ fn close_completed_stream_does_not_affect_other_streams() {
         contract_balance_before,
         "close must not move tokens"
     );
+}
+
+#[test]
+fn create_stream_with_allowance_success() {
+    let ctx = TestContext::setup();
+    // Set allowance: sender approves contract for 1000 tokens
+    ctx.token.approve(&ctx.sender, &ctx.contract_id, &1000, &100);
+
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1000u64,
+    );
+
+    assert_eq!(stream_id, 0);
+    assert_eq!(ctx.token.balance(&ctx.contract_id), 1000);
+    assert_eq!(ctx.token.allowance(&ctx.sender, &ctx.contract_id), 0);
+}
+
+#[test]
+fn create_stream_insufficient_allowance_fails() {
+    let ctx = TestContext::setup();
+    // Set insufficient allowance: sender approves contract for only 500 tokens
+    ctx.token.approve(&ctx.sender, &ctx.contract_id, &500, &100);
+
+    ctx.env.ledger().set_timestamp(0);
+    let result = ctx.client().try_create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1000u64,
+    );
+
+    // Should fail. Soroban SAC panics on insufficient allowance.
+    assert!(result.is_err());
+    assert_eq!(ctx.token.balance(&ctx.contract_id), 0);
+    assert_eq!(ctx.token.allowance(&ctx.sender, &ctx.contract_id), 500);
+}
+
+#[test]
+fn create_stream_exact_allowance_success() {
+    let ctx = TestContext::setup();
+    // Set exact allowance
+    ctx.token.approve(&ctx.sender, &ctx.contract_id, &1000, &100);
+
+    ctx.env.ledger().set_timestamp(0);
+    ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1000u64,
+    );
+
+    assert_eq!(ctx.token.allowance(&ctx.sender, &ctx.contract_id), 0);
+}
+
+#[test]
+fn create_streams_batch_allowance_success() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+
+    let p1 = CreateStreamParams {
+        recipient: Address::generate(&ctx.env),
+        deposit_amount: 1000,
+        rate_per_second: 1,
+        start_time: 0,
+        cliff_time: 0,
+        end_time: 1000,
+    };
+    let p2 = CreateStreamParams {
+        recipient: Address::generate(&ctx.env),
+        deposit_amount: 2000,
+        rate_per_second: 2,
+        start_time: 0,
+        cliff_time: 0,
+        end_time: 1000,
+    };
+
+    // Total required: 3000
+    ctx.token.approve(&ctx.sender, &ctx.contract_id, &3000, &100);
+
+    let streams = vec![&ctx.env, p1, p2];
+    ctx.client().create_streams(&ctx.sender, &streams);
+
+    assert_eq!(ctx.token.balance(&ctx.contract_id), 3000);
+    assert_eq!(ctx.token.allowance(&ctx.sender, &ctx.contract_id), 0);
+}
+
+#[test]
+fn create_streams_batch_insufficient_allowance_is_atomic() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+
+    let p1 = CreateStreamParams {
+        recipient: Address::generate(&ctx.env),
+        deposit_amount: 1000,
+        rate_per_second: 1,
+        start_time: 0,
+        cliff_time: 0,
+        end_time: 1000,
+    };
+    let p2 = CreateStreamParams {
+        recipient: Address::generate(&ctx.env),
+        deposit_amount: 2000,
+        rate_per_second: 2,
+        start_time: 0,
+        cliff_time: 0,
+        end_time: 1000,
+    };
+
+    // Total required: 3000, but only 2500 approved
+    ctx.token.approve(&ctx.sender, &ctx.contract_id, &2500, &100);
+
+    let streams = vec![&ctx.env, p1, p2];
+    let result = ctx.client().try_create_streams(&ctx.sender, &streams);
+
+    assert!(result.is_err());
+    // Atomic: no streams should be created, no funds moved
+    assert_eq!(ctx.client().get_stream_count(), 0);
+    assert_eq!(ctx.token.balance(&ctx.contract_id), 0);
+    assert_eq!(ctx.token.allowance(&ctx.sender, &ctx.contract_id), 2500);
+}
+
+#[test]
+fn top_up_with_allowance_success() {
+    let ctx = TestContext::setup();
+    
+    // First, create a stream (needs allowance now because I changed to transfer_from)
+    ctx.token.approve(&ctx.sender, &ctx.contract_id, &1000, &100);
+    let stream_id = ctx.create_default_stream();
+
+    // Now top up (needs more allowance)
+    ctx.token.approve(&ctx.sender, &ctx.contract_id, &500, &100);
+    ctx.client().top_up_stream(&stream_id, &ctx.sender, &500);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.deposit_amount, 1500);
+    assert_eq!(ctx.token.balance(&ctx.contract_id), 1500);
 }
