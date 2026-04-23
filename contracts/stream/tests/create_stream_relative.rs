@@ -101,7 +101,7 @@ fn create_stream_relative_positive_delays_future_start() {
     let stream_id = ctx.client().create_stream_relative(
         &ctx.sender,
         &ctx.recipient,
-        &4000_i128,  // deposit_amount: 4000 (2 * 2000)
+        &4000_i128, // deposit_amount: 4000 (2 * 2000)
         &2_i128,
         &100u64,  // start_delay: 100 -> start_time = 1100
         &500u64,  // cliff_delay: 500 -> cliff_time = 1500
@@ -332,7 +332,7 @@ fn create_streams_relative_multiple_entries_sequential_ids() {
         },
         CreateStreamRelativeParams {
             recipient: recipient2.clone(),
-            deposit_amount: 4000,  // 2 * 2000
+            deposit_amount: 4000, // 2 * 2000
             rate_per_second: 2,
             start_delay: 100,
             cliff_delay: 100,
@@ -435,7 +435,7 @@ fn create_streams_relative_diverse_schedules() {
         },
         CreateStreamRelativeParams {
             recipient: r2,
-            deposit_amount: 400,  // 2 * 200
+            deposit_amount: 400, // 2 * 200
             rate_per_second: 2,
             start_delay: 500,
             cliff_delay: 600,
@@ -443,7 +443,7 @@ fn create_streams_relative_diverse_schedules() {
         },
         CreateStreamRelativeParams {
             recipient: r3,
-            deposit_amount: 900,  // 3 * 300
+            deposit_amount: 900, // 3 * 300
             rate_per_second: 3,
             start_delay: 1000,
             cliff_delay: 1200,
