@@ -29,6 +29,11 @@ const PERSISTENT_BUMP_AMOUNT: u32 = 120_960;
 /// All paginated entrypoints enforce this limit strictly.
 pub const MAX_PAGE_SIZE: u64 = 100;
 
+/// Maximum schedule templates a single owner may register (bounds `OwnerTemplateIds` growth).
+pub const MAX_TEMPLATES_PER_OWNER: u32 = 64;
+/// Global bound on stored schedule templates (DoS / storage bloat prevention).
+pub const MAX_GLOBAL_TEMPLATES: u64 = 10_000;
+
 // Contract version
 // ---------------------------------------------------------------------------
 
@@ -82,7 +87,9 @@ pub const MAX_PAGE_SIZE: u64 = 100;
 ///   Code review and CI checks on this constant are the primary safeguard.
 /// Bumped to 2: `Stream` struct gained `checkpointed_amount: i128` and `checkpointed_at: u64`
 /// for safe rate-decrease support (see `decrease_rate_per_second`).
-pub const CONTRACT_VERSION: u32 = 2;
+/// Bumped to 3: stream schedule templates (`register_stream_template`, `delete_stream_template`,
+/// `create_stream_from_template`, new `DataKey` variants at the end of the enum).
+pub const CONTRACT_VERSION: u32 = 3;
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -133,6 +140,12 @@ pub enum ContractError {
     StreamTerminalState = 13,
     /// Duplicate stream IDs were supplied to a batch operation.
     DuplicateStreamId = 14,
+    /// No template exists for the given template id.
+    TemplateNotFound = 15,
+    /// Template registry limits exceeded (per-owner or global cap).
+    TemplateLimitExceeded = 16,
+    /// Caller is not the template owner for a protected template operation.
+    TemplateUnauthorized = 17,
 }
 
 #[contracttype]
@@ -369,6 +382,17 @@ pub struct CreateStreamRelativeParams {
     pub duration: u64,
 }
 
+/// Reusable relative schedule (offsets only). Amounts are supplied when creating a stream.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamScheduleTemplate {
+    pub template_id: u64,
+    pub owner: Address,
+    pub start_delay: u64,
+    pub cliff_delay: u64,
+    pub duration: u64,
+}
+
 /// Namespace for all contract storage keys.
 ///
 /// # Evolution policy
@@ -390,17 +414,7 @@ pub struct CreateStreamRelativeParams {
 /// 5. Document the ledger at which each variant was first deployed so that
 ///    migration tooling can determine which entries exist on a given instance.
 ///
-/// Current discriminant assignments (must never change):
-///
-/// | Discriminant | Variant | Storage type | Notes |
-/// |---|---|---|---|
-/// | 0 | `Config` | Instance | Set at `init`; mutated only by `set_admin` |
-/// | 1 | `NextStreamId` | Instance | Monotonically increasing `u64` counter |
-/// | 2 | `Stream(u64)` | Persistent | One entry per stream |
-/// | 3 | `RecipientStreams(Address)` | Persistent | Sorted `Vec<u64>` of stream IDs |
-/// | 4 | `GlobalEmergencyPaused` | Instance | `bool`; appended to avoid shifting earlier discriminants |
-/// | 5 | `CreationPaused` | Instance | `bool`; creation-only circuit breaker |
-/// | 6 | `AutoClaimDestination(u64)` | Persistent | `Address`; recipient-chosen auto-claim destination per stream |
+/// Current discriminant assignments (must never change) — see enum definition below for order.
 #[contracttype]
 pub enum DataKey {
     Config,                    // Instance storage for global settings (admin/token).
@@ -419,6 +433,14 @@ pub enum DataKey {
     GlobalPauseAdmin,
     /// Auto-claim destination per stream (Address). Set by recipient to redirect withdrawals.
     AutoClaimDestination(u64),
+    /// Monotonic template id counter (`u64`, instance storage).
+    NextTemplateId,
+    /// Number of templates currently stored (`u64`, instance storage).
+    ActiveTemplateCount,
+    /// Registered relative schedule template (persistent).
+    StreamTemplate(u64),
+    /// Template ids owned by an address (persistent `Vec<u64>`; length capped).
+    OwnerTemplateIds(Address),
 }
 
 // ---------------------------------------------------------------------------
@@ -619,6 +641,140 @@ fn remove_stream_from_recipient_index(env: &Env, recipient: &Address, stream_id:
         streams.remove(idx);
         save_recipient_streams(env, recipient, &streams);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Stream schedule template storage helpers
+// ---------------------------------------------------------------------------
+
+fn validate_template_delays(
+    env: &Env,
+    start_delay: u64,
+    cliff_delay: u64,
+    duration: u64,
+) -> Result<(), ContractError> {
+    if duration == 0 {
+        return Err(ContractError::InvalidParams);
+    }
+    if cliff_delay < start_delay {
+        return Err(ContractError::InvalidParams);
+    }
+    let now = env.ledger().timestamp();
+    let start_time = now
+        .checked_add(start_delay)
+        .ok_or(ContractError::InvalidParams)?;
+    let cliff_time = now
+        .checked_add(cliff_delay)
+        .ok_or(ContractError::InvalidParams)?;
+    let end_time = start_time
+        .checked_add(duration)
+        .ok_or(ContractError::InvalidParams)?;
+    if cliff_time > end_time {
+        return Err(ContractError::InvalidParams);
+    }
+    Ok(())
+}
+
+fn read_next_template_id(env: &Env) -> u64 {
+    bump_instance_ttl(env);
+    env.storage()
+        .instance()
+        .get(&DataKey::NextTemplateId)
+        .unwrap_or(0u64)
+}
+
+fn set_next_template_id(env: &Env, id: u64) {
+    env.storage().instance().set(&DataKey::NextTemplateId, &id);
+    bump_instance_ttl(env);
+}
+
+fn read_active_template_count(env: &Env) -> u64 {
+    bump_instance_ttl(env);
+    env.storage()
+        .instance()
+        .get(&DataKey::ActiveTemplateCount)
+        .unwrap_or(0u64)
+}
+
+fn set_active_template_count(env: &Env, n: u64) {
+    env.storage().instance().set(&DataKey::ActiveTemplateCount, &n);
+    bump_instance_ttl(env);
+}
+
+fn load_owner_template_ids(env: &Env, owner: &Address) -> soroban_sdk::Vec<u64> {
+    let key = DataKey::OwnerTemplateIds(owner.clone());
+    env.storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| soroban_sdk::Vec::new(env))
+}
+
+fn save_owner_template_ids(env: &Env, owner: &Address, ids: &soroban_sdk::Vec<u64>) {
+    let key = DataKey::OwnerTemplateIds(owner.clone());
+    env.storage().persistent().set(&key, ids);
+    env.storage().persistent().extend_ttl(
+        &key,
+        PERSISTENT_LIFETIME_THRESHOLD,
+        PERSISTENT_BUMP_AMOUNT,
+    );
+}
+
+fn load_stream_template(
+    env: &Env,
+    template_id: u64,
+) -> Result<StreamScheduleTemplate, ContractError> {
+    let key = DataKey::StreamTemplate(template_id);
+    let t: StreamScheduleTemplate = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .ok_or(ContractError::TemplateNotFound)?;
+    env.storage().persistent().extend_ttl(
+        &key,
+        PERSISTENT_LIFETIME_THRESHOLD,
+        PERSISTENT_BUMP_AMOUNT,
+    );
+    Ok(t)
+}
+
+fn save_stream_template(env: &Env, template: &StreamScheduleTemplate) {
+    let key = DataKey::StreamTemplate(template.template_id);
+    env.storage().persistent().set(&key, template);
+    env.storage().persistent().extend_ttl(
+        &key,
+        PERSISTENT_LIFETIME_THRESHOLD,
+        PERSISTENT_BUMP_AMOUNT,
+    );
+}
+
+fn remove_stream_template_storage(env: &Env, template_id: u64) {
+    let key = DataKey::StreamTemplate(template_id);
+    env.storage().persistent().remove(&key);
+}
+
+fn remove_template_id_for_owner(
+    env: &Env,
+    owner: &Address,
+    template_id: u64,
+) -> Result<(), ContractError> {
+    let ids = load_owner_template_ids(env, owner);
+    let mut out = soroban_sdk::Vec::new(env);
+    let mut found = false;
+    let mut i: u32 = 0;
+    while i < ids.len() {
+        let id = ids.get(i).unwrap();
+        if id == template_id {
+            found = true;
+        } else {
+            out.push_back(id);
+        }
+        i += 1;
+    }
+    if !found {
+        return Err(ContractError::TemplateNotFound);
+    }
+    save_owner_template_ids(env, owner, &out);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -895,6 +1051,8 @@ impl FluxoraStream {
         let config = Config { token, admin };
         env.storage().instance().set(&DataKey::Config, &config);
         env.storage().instance().set(&DataKey::NextStreamId, &0u64);
+        env.storage().instance().set(&DataKey::NextTemplateId, &0u64);
+        env.storage().instance().set(&DataKey::ActiveTemplateCount, &0u64);
 
         // Ensure instance storage (Config / NextStreamId) doesn't expire quickly
         bump_instance_ttl(&env);
@@ -2912,6 +3070,91 @@ impl FluxoraStream {
         remove_stream(&env, stream_id);
 
         Ok(())
+    }
+
+    /// Register a reusable relative schedule (start/cliff/duration offsets only).
+    ///
+    /// Caps: [`MAX_TEMPLATES_PER_OWNER`] per registering address and [`MAX_GLOBAL_TEMPLATES`]
+    /// across all owners. Only `owner` may delete via [`Self::delete_stream_template`].
+    pub fn register_stream_template(
+        env: Env,
+        owner: Address,
+        start_delay: u64,
+        cliff_delay: u64,
+        duration: u64,
+    ) -> Result<u64, ContractError> {
+        owner.require_auth();
+        validate_template_delays(&env, start_delay, cliff_delay, duration)?;
+        let ids = load_owner_template_ids(&env, &owner);
+        if ids.len() >= MAX_TEMPLATES_PER_OWNER {
+            return Err(ContractError::TemplateLimitExceeded);
+        }
+        let active = read_active_template_count(&env);
+        if active >= MAX_GLOBAL_TEMPLATES {
+            return Err(ContractError::TemplateLimitExceeded);
+        }
+        let template_id = read_next_template_id(&env);
+        let tpl = StreamScheduleTemplate {
+            template_id,
+            owner: owner.clone(),
+            start_delay,
+            cliff_delay,
+            duration,
+        };
+        save_stream_template(&env, &tpl);
+        let mut new_ids = ids;
+        new_ids.push_back(template_id);
+        save_owner_template_ids(&env, &owner, &new_ids);
+        set_next_template_id(&env, template_id + 1);
+        set_active_template_count(&env, active + 1);
+        env.events()
+            .publish((symbol_short!("tmpl_def"), template_id), tpl.clone());
+        Ok(template_id)
+    }
+
+    /// Delete a schedule template. Only the registering `owner` may call.
+    pub fn delete_stream_template(
+        env: Env,
+        owner: Address,
+        template_id: u64,
+    ) -> Result<(), ContractError> {
+        owner.require_auth();
+        let tpl = load_stream_template(&env, template_id)?;
+        if tpl.owner != owner {
+            return Err(ContractError::TemplateUnauthorized);
+        }
+        remove_stream_template_storage(&env, template_id);
+        remove_template_id_for_owner(&env, &owner, template_id)?;
+        let active = read_active_template_count(&env);
+        set_active_template_count(&env, active.saturating_sub(1));
+        Ok(())
+    }
+
+    /// Create a stream using a registered template's relative timing plus caller-funded amounts.
+    pub fn create_stream_from_template(
+        env: Env,
+        sender: Address,
+        template_id: u64,
+        recipient: Address,
+        deposit_amount: i128,
+        rate_per_second: i128,
+    ) -> Result<u64, ContractError> {
+        let tpl = load_stream_template(&env, template_id)?;
+        Self::create_stream_relative(
+            env,
+            sender,
+            recipient,
+            deposit_amount,
+            rate_per_second,
+            tpl.start_delay,
+            tpl.cliff_delay,
+            tpl.duration,
+        )
+    }
+
+    /// Read a schedule template by id (permissionless view).
+    pub fn get_stream_template(env: Env, template_id: u64) -> Result<StreamScheduleTemplate, ContractError> {
+        load_stream_template(&env, template_id)
     }
 
     /// Return the compile-time contract version number.
