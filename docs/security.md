@@ -141,6 +141,7 @@ reentrancy impact — state will already reflect the current operation when the 
 | `close_completed_stream`  | Permissionless (any caller)                             |
 | `set_admin`               | Current contract admin                                  |
 | `set_contract_paused`     | Contract admin                                          |
+| `transfer_sender`         | Current stream sender                                   |
 
 Cancellation-specific boundary checks:
 
