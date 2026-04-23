@@ -17381,9 +17381,9 @@ mod recipient_index_stress {
         assert_eq!(streams.len(), 3, "Should return 3 streams");
 
         // Verify order and content
-        assert_eq!(streams.get(0).unwrap().id, 1);
-        assert_eq!(streams.get(1).unwrap().id, 2);
-        assert_eq!(streams.get(2).unwrap().id, 3);
+        assert_eq!(streams.get(0).unwrap().stream_id, 1);
+        assert_eq!(streams.get(1).unwrap().stream_id, 2);
+        assert_eq!(streams.get(2).unwrap().stream_id, 3);
     }
 
     #[test]
@@ -17453,9 +17453,9 @@ mod recipient_index_stress {
         // Range should return streams 1, 3, 4 (skipping closed stream 2)
         let streams = ctx.client().get_streams_by_id_range(&1, &4, &10);
         assert_eq!(streams.len(), 3, "Should skip closed stream");
-        assert_eq!(streams.get(0).unwrap().id, 1);
-        assert_eq!(streams.get(1).unwrap().id, 3);
-        assert_eq!(streams.get(2).unwrap().id, 4);
+        assert_eq!(streams.get(0).unwrap().stream_id, 1);
+        assert_eq!(streams.get(1).unwrap().stream_id, 3);
+        assert_eq!(streams.get(2).unwrap().stream_id, 4);
     }
 
     #[test]
@@ -17480,8 +17480,8 @@ mod recipient_index_stress {
         let max = u64::MAX;
         let streams = ctx.client().get_streams_by_id_range(&5, &max, &5);
         assert_eq!(streams.len(), 5, "Should return 5 streams from position 5");
-        assert_eq!(streams.get(0).unwrap().id, 5);
-        assert_eq!(streams.get(4).unwrap().id, 9);
+        assert_eq!(streams.get(0).unwrap().stream_id, 5);
+        assert_eq!(streams.get(4).unwrap().stream_id, 9);
     }
 
     #[test]

@@ -417,6 +417,8 @@ pub enum DataKey {
     GlobalPauseTimestamp,
     /// Protocol pause admin (Address). The admin address that activated the pause.
     GlobalPauseAdmin,
+    /// Auto-claim destination per stream (Address). Set by recipient to redirect withdrawals.
+    AutoClaimDestination(u64),
 }
 
 // ---------------------------------------------------------------------------
