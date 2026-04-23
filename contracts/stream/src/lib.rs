@@ -401,6 +401,8 @@ pub struct CreateStreamRelativeParams {
 /// | 2 | `Stream(u64)` | Persistent | One entry per stream |
 /// | 3 | `RecipientStreams(Address)` | Persistent | Sorted `Vec<u64>` of stream IDs |
 /// | 4 | `GlobalEmergencyPaused` | Instance | `bool`; appended to avoid shifting earlier discriminants |
+/// | 5 | `CreationPaused` | Instance | `bool`; creation-only circuit breaker |
+/// | 6 | `AutoClaimDestination(u64)` | Persistent | `Address`; recipient-chosen auto-claim destination per stream |
 #[contracttype]
 pub enum DataKey {
     Config,                    // Instance storage for global settings (admin/token).
@@ -626,10 +628,43 @@ fn remove_stream_from_recipient_index(env: &Env, recipient: &Address, stream_id:
 }
 
 // ---------------------------------------------------------------------------
-// Token transfer helpers
+// Auto-claim storage helpers
 // ---------------------------------------------------------------------------
 
-/// Pull tokens from an external address to the contract.
+/// Load the auto-claim destination for a stream, if set.
+fn load_auto_claim_destination(env: &Env, stream_id: u64) -> Option<Address> {
+    let key = DataKey::AutoClaimDestination(stream_id);
+    let result: Option<Address> = env.storage().persistent().get(&key);
+    if result.is_some() {
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+    }
+    result
+}
+
+/// Persist the auto-claim destination for a stream.
+fn save_auto_claim_destination(env: &Env, stream_id: u64, destination: &Address) {
+    let key = DataKey::AutoClaimDestination(stream_id);
+    env.storage().persistent().set(&key, destination);
+    env.storage().persistent().extend_ttl(
+        &key,
+        PERSISTENT_LIFETIME_THRESHOLD,
+        PERSISTENT_BUMP_AMOUNT,
+    );
+}
+
+/// Remove the auto-claim destination for a stream (opt-out / revoke).
+fn remove_auto_claim_destination(env: &Env, stream_id: u64) {
+    let key = DataKey::AutoClaimDestination(stream_id);
+    env.storage().persistent().remove(&key);
+}
+
+// ---------------------------------------------------------------------------
+// Token transfer helpers
+// ---------------------------------------------------------------------------
 ///
 /// Centralizes all token transfers INTO the contract for security review.
 /// Used when creating streams to pull deposit from sender.
