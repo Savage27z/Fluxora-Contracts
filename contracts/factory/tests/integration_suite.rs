@@ -38,7 +38,7 @@ fn setup_env<'a>() -> (
     // Deploy Stream Contract
     let stream_id = env.register_contract(None, fluxora_stream::FluxoraStream {});
     let stream_client = fluxora_stream::FluxoraStreamClient::new(&env, &stream_id);
-    
+
     // Initialize stream contract with proper Address types
     stream_client.init(&token_address, &admin);
 
