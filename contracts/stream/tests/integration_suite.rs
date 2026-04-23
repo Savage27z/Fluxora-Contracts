@@ -3750,3 +3750,210 @@ fn test_batch_withdraw_to_contract_address_fails() {
     let res = ctx.client().try_batch_withdraw_to(&ctx.recipient, &params);
     assert_eq!(res, Err(Ok(fluxora_stream::ContractError::InvalidParams)));
 }
+
+// ===========================================================================
+// Issue #417 — transfer_sender: sender rotation with strict auth and event
+// ===========================================================================
+
+use fluxora_stream::SenderTransferred;
+
+/// Basic success: new_sender is stored, old_sender loses rights, event emitted.
+#[test]
+fn transfer_sender_success_updates_sender_and_emits_event() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id = ctx.create_default_stream();
+
+    let new_sender = Address::generate(&ctx.env);
+    let events_before = ctx.env.events().all().len();
+
+    ctx.client().transfer_sender(&stream_id, &new_sender);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.sender, new_sender, "sender must be updated");
+
+    // Verify event
+    let events = ctx.env.events().all();
+    let evt = events
+        .iter()
+        .skip(events_before as usize)
+        .find(|(contract, topics, _)| {
+            contract == &ctx.contract_id
+                && topics.len() == 2
+                && Symbol::try_from_val(&ctx.env, &topics.get(0).unwrap())
+                    == Ok(Symbol::new(&ctx.env, "sndr_xfr"))
+                && u64::try_from_val(&ctx.env, &topics.get(1).unwrap()) == Ok(stream_id)
+        })
+        .expect("sndr_xfr event must be emitted");
+
+    let payload = SenderTransferred::try_from_val(&ctx.env, &evt.2)
+        .expect("event payload must decode as SenderTransferred");
+    assert_eq!(payload.stream_id, stream_id);
+    assert_eq!(payload.old_sender, ctx.sender);
+    assert_eq!(payload.new_sender, new_sender);
+}
+
+/// Old sender loses pause/cancel rights after transfer.
+#[test]
+fn transfer_sender_old_sender_loses_rights() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id = ctx.create_default_stream();
+
+    let new_sender = Address::generate(&ctx.env);
+    ctx.client().transfer_sender(&stream_id, &new_sender);
+
+    // Old sender trying to pause must fail (strict mode)
+    let env = &ctx.env;
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &ctx.sender,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &ctx.contract_id,
+            fn_name: "pause_stream",
+            args: (stream_id,).into_val(env),
+            sub_invokes: &[],
+        },
+    }]);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ctx.client().pause_stream(&stream_id);
+    }));
+    assert!(result.is_err(), "old sender must not be able to pause after transfer");
+}
+
+/// New sender gains pause/cancel rights after transfer.
+#[test]
+fn transfer_sender_new_sender_gains_rights() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id = ctx.create_default_stream();
+
+    let new_sender = Address::generate(&ctx.env);
+    ctx.client().transfer_sender(&stream_id, &new_sender);
+
+    // New sender can pause (mock_all_auths is active in TestContext::setup)
+    ctx.client().pause_stream(&stream_id);
+    assert_eq!(
+        ctx.client().get_stream_state(&stream_id).status,
+        StreamStatus::Paused
+    );
+
+    // New sender can resume
+    ctx.client().resume_stream(&stream_id);
+    assert_eq!(
+        ctx.client().get_stream_state(&stream_id).status,
+        StreamStatus::Active
+    );
+
+    // New sender can cancel
+    ctx.env.ledger().set_timestamp(500);
+    ctx.client().cancel_stream(&stream_id);
+    assert_eq!(
+        ctx.client().get_stream_state(&stream_id).status,
+        StreamStatus::Cancelled
+    );
+}
+
+/// Recipient entitlement is unchanged after sender transfer.
+#[test]
+fn transfer_sender_recipient_entitlement_unchanged() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id = ctx.create_default_stream();
+
+    let new_sender = Address::generate(&ctx.env);
+    ctx.client().transfer_sender(&stream_id, &new_sender);
+
+    // Recipient can still withdraw accrued tokens
+    ctx.env.ledger().set_timestamp(600);
+    let withdrawn = ctx.client().withdraw(&stream_id);
+    assert_eq!(withdrawn, 600, "recipient entitlement must be unchanged");
+    assert_eq!(ctx.token.balance(&ctx.recipient), 600);
+}
+
+/// Transfer on a paused stream succeeds.
+#[test]
+fn transfer_sender_works_on_paused_stream() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(200);
+    ctx.client().pause_stream(&stream_id);
+
+    let new_sender = Address::generate(&ctx.env);
+    let result = ctx.client().try_transfer_sender(&stream_id, &new_sender);
+    assert!(result.is_ok(), "transfer_sender must succeed on paused stream");
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.sender, new_sender);
+    assert_eq!(state.status, StreamStatus::Paused);
+}
+
+/// Transfer on a completed stream returns InvalidState.
+#[test]
+fn transfer_sender_rejects_completed_stream() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(1000);
+    ctx.client().withdraw(&stream_id);
+
+    let new_sender = Address::generate(&ctx.env);
+    let result = ctx.client().try_transfer_sender(&stream_id, &new_sender);
+    assert_eq!(result, Err(Ok(ContractError::InvalidState)));
+}
+
+/// Transfer on a cancelled stream returns InvalidState.
+#[test]
+fn transfer_sender_rejects_cancelled_stream() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(300);
+    ctx.client().cancel_stream(&stream_id);
+
+    let new_sender = Address::generate(&ctx.env);
+    let result = ctx.client().try_transfer_sender(&stream_id, &new_sender);
+    assert_eq!(result, Err(Ok(ContractError::InvalidState)));
+}
+
+/// Transfer to the same address returns InvalidParams.
+#[test]
+fn transfer_sender_rejects_same_sender() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id = ctx.create_default_stream();
+
+    let result = ctx.client().try_transfer_sender(&stream_id, &ctx.sender);
+    assert_eq!(result, Err(Ok(ContractError::InvalidParams)));
+}
+
+/// Transfer to the recipient address returns InvalidParams.
+#[test]
+fn transfer_sender_rejects_recipient_as_new_sender() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id = ctx.create_default_stream();
+
+    let result = ctx.client().try_transfer_sender(&stream_id, &ctx.recipient);
+    assert_eq!(result, Err(Ok(ContractError::InvalidParams)));
+}
+
+/// Chained transfers: A → B → C, each step updates sender correctly.
+#[test]
+fn transfer_sender_chained_transfers() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id = ctx.create_default_stream();
+
+    let sender_b = Address::generate(&ctx.env);
+    let sender_c = Address::generate(&ctx.env);
+
+    ctx.client().transfer_sender(&stream_id, &sender_b);
+    assert_eq!(ctx.client().get_stream_state(&stream_id).sender, sender_b);
+
+    ctx.client().transfer_sender(&stream_id, &sender_c);
+    assert_eq!(ctx.client().get_stream_state(&stream_id).sender, sender_c);
+}

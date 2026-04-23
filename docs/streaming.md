@@ -496,6 +496,7 @@ contract.create_streams_relative(&sender, &params)?;
 | `decrease_rate_per_second`| Sender                        | `sender.require_auth()`                     |
 | `shorten_stream_end_time` | Sender                        | `sender.require_auth()`                     |
 | `extend_stream_end_time`  | Sender                        | `sender.require_auth()`                     |
+| `transfer_sender`         | Current stream sender         | `sender.require_auth()`                     |
 | `set_auto_claim`          | Recipient                     | `recipient.require_auth()`                  |
 | `revoke_auto_claim`       | Recipient                     | `recipient.require_auth()`                  |
 | `trigger_auto_claim`      | Anyone                        | None (permissionless; destination fixed by recipient) |
@@ -628,6 +629,32 @@ A naive decrease would retroactively lower the recipient's accrued tokens. To pr
 - Accrued amounts never decrease due to rate updates.
 - Recipient entitlement is preserved or increased.
 - Deposit coverage ensures the stream remains fully fundable at the new rate.
+
+### transfer_sender: Observable Semantics
+
+`transfer_sender(stream_id, new_sender)` allows the current stream sender to rotate the treasury key for an existing stream.
+
+#### Success Semantics (Observable)
+
+- **Authorization**: Only the current stream `sender` can authorize the call.
+- **State Requirements**: Stream must be in `Active` or `Paused` status (not `Completed` or `Cancelled`).
+- **Parameter Validation**: `new_sender != current_sender` and `new_sender != recipient`.
+- **State Change**: `stream.sender` is updated to `new_sender`. All other fields are unchanged.
+- **Immediate Effect**: `new_sender` gains all sender-role privileges (pause, resume, cancel, rate updates, schedule changes) immediately. `old_sender` loses them immediately.
+- **Recipient Entitlement**: Unchanged. Accrued amounts, `withdrawn_amount`, and schedule are unaffected.
+- **Event**: Emits `("sndr_xfr", stream_id)` with `SenderTransferred { stream_id, old_sender, new_sender }`.
+
+#### Failure Semantics (Observable)
+
+- **StreamNotFound**: Invalid `stream_id`.
+- **Unauthorized**: Caller is not the current stream sender.
+- **InvalidState**: Stream is `Completed` or `Cancelled`.
+- **InvalidParams**: `new_sender == current_sender` or `new_sender == recipient`.
+- **Atomicity**: Any failure reverts the entire transaction with no state changes or events.
+
+#### Use Case
+
+Treasury key rotation: when a treasury wallet is being rotated, the operator calls `transfer_sender` to hand over stream management rights to the new key without disrupting the recipient's accrual or requiring stream recreation.
 
 ### batch_withdraw: completed stream behavior
 

@@ -32,6 +32,7 @@ Notes:
 | ContractPaused   | `["paused_ctl"]`                | `bool`                                                                                                                                                    | When the global contract pause state is toggled via `set_contract_paused`.                                              |
 | ProtocolPaused   | `["pr_pause", admin: Address]`  | `ProtocolPaused { reason: String, paused_at: u64 }`                                                                                                       | When `pause_protocol` successfully pauses the protocol. Not emitted on idempotent calls.                               |
 | ProtocolResumed  | `["pr_resume", admin: Address]` | `ProtocolResumed { resumed_at: u64 }`                                                                                                                     | When `resume_protocol` successfully resumes the protocol. Not emitted on idempotent calls.                             |
+| SenderTransferred | `["sndr_xfr", stream_id: u64]` | `SenderTransferred { stream_id: u64, old_sender: Address, new_sender: Address }`                                                                          | When `transfer_sender` successfully rotates the stream sender. Emitted after state is persisted. Not emitted on failure. |
 
 ---
 | Event name | Topic(s) | Data (shape & types) | When emitted |
@@ -293,6 +294,35 @@ Example:
   }
 }
 ```
+
+### 12) SenderTransferred
+
+Emitted by `transfer_sender` when the stream sender is successfully rotated.
+
+```
+topics: ["sndr_xfr", <stream_id: u64>]
+data:   SenderTransferred {
+          stream_id:  u64,
+          old_sender: Address,
+          new_sender: Address,
+        }
+```
+
+Example:
+
+```json
+{
+  "topics": ["sndr_xfr", 0],
+  "data": {
+    "stream_id": 0,
+    "old_sender": "G...OLD_SENDER...",
+    "new_sender": "G...NEW_SENDER..."
+  }
+}
+```
+
+Indexers should update their sender reference for the stream on receipt of this event.
+The `old_sender` field allows indexers to correlate the previous treasury key.
 
 ---
 

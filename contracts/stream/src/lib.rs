@@ -252,6 +252,18 @@ pub struct StreamToppedUp {
     pub new_end_time: u64,
 }
 
+/// Emitted when the stream sender is rotated via `transfer_sender`.
+///
+/// The `old_sender` loses all sender-role privileges (pause, cancel, rate updates, etc.)
+/// and the `new_sender` gains them immediately. Recipient entitlement is unchanged.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct SenderTransferred {
+    pub stream_id: u64,
+    pub old_sender: Address,
+    pub new_sender: Address,
+}
+
 /// Emitted when the contract admin toggles the global emergency pause flag.
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -2910,6 +2922,76 @@ impl FluxoraStream {
         // Remove stream from recipient's index before deleting the stream
         remove_stream_from_recipient_index(&env, &stream.recipient, stream_id);
         remove_stream(&env, stream_id);
+
+        Ok(())
+    }
+
+    /// Transfer sender ownership of a stream to a new address.
+    ///
+    /// Allows the current sender to rotate the treasury key for an existing stream.
+    /// After a successful call the `new_sender` gains all sender-role privileges
+    /// (pause, resume, cancel, rate updates, schedule changes) and the `old_sender`
+    /// loses them immediately. The recipient's accrued entitlement is never affected.
+    ///
+    /// # Parameters
+    /// - `stream_id`: Unique identifier of the stream to update.
+    /// - `new_sender`: Address that will become the new stream sender.
+    ///
+    /// # Authorization
+    /// - Requires authorization from the **current** stream sender only.
+    ///
+    /// # Validation
+    /// - Stream must exist.
+    /// - Stream must be in `Active` or `Paused` state (not terminal).
+    /// - `new_sender` must differ from the current sender.
+    /// - `new_sender` must differ from the stream's recipient (no self-streaming).
+    ///
+    /// # State Changes
+    /// - `stream.sender` is updated to `new_sender`.
+    ///
+    /// # Events
+    /// - Emits `("sndr_xfr", stream_id)` → `SenderTransferred { stream_id, old_sender, new_sender }`.
+    ///
+    /// # Errors
+    /// - `StreamNotFound` — invalid `stream_id`.
+    /// - `InvalidState` — stream is `Completed` or `Cancelled`.
+    /// - `InvalidParams` — `new_sender == old_sender` or `new_sender == recipient`.
+    /// - `Unauthorized` — caller is not the current sender.
+    pub fn transfer_sender(
+        env: Env,
+        stream_id: u64,
+        new_sender: Address,
+    ) -> Result<(), ContractError> {
+        let mut stream = load_stream(&env, stream_id)?;
+
+        // Only the current sender may initiate a transfer.
+        Self::require_stream_sender(&stream.sender);
+
+        // Only non-terminal streams can have their sender rotated.
+        Self::require_cancellable_status(stream.status)?;
+
+        // new_sender must be a different address.
+        if new_sender == stream.sender {
+            return Err(ContractError::InvalidParams);
+        }
+
+        // new_sender must not be the recipient (would create a self-stream).
+        if new_sender == stream.recipient {
+            return Err(ContractError::InvalidParams);
+        }
+
+        let old_sender = stream.sender.clone();
+        stream.sender = new_sender.clone();
+        save_stream(&env, &stream);
+
+        env.events().publish(
+            (symbol_short!("sndr_xfr"), stream_id),
+            SenderTransferred {
+                stream_id,
+                old_sender,
+                new_sender,
+            },
+        );
 
         Ok(())
     }
