@@ -427,27 +427,27 @@ fn create_streams_relative_diverse_schedules() {
         &ctx.env,
         CreateStreamRelativeParams {
             recipient: r1,
-            deposit_amount: 1000,
+            deposit_amount: 100,
             rate_per_second: 1,
             start_delay: 0,
             cliff_delay: 0,
-            duration: 1000,
+            duration: 100,
         },
         CreateStreamRelativeParams {
             recipient: r2,
-            deposit_amount: 4000,  // 2 * 2000
+            deposit_amount: 400,  // 2 * 200
             rate_per_second: 2,
             start_delay: 500,
-            cliff_delay: 1000,
-            duration: 2000,
+            cliff_delay: 600,
+            duration: 200,
         },
         CreateStreamRelativeParams {
             recipient: r3,
-            deposit_amount: 9000,  // 3 * 3000
+            deposit_amount: 900,  // 3 * 300
             rate_per_second: 3,
             start_delay: 1000,
-            cliff_delay: 2000,
-            duration: 3000,
+            cliff_delay: 1200,
+            duration: 300,
         },
     ];
 
@@ -457,17 +457,17 @@ fn create_streams_relative_diverse_schedules() {
     // Verify all three streams created with correct schedules
     let s0 = ctx.client().get_stream_state(&ids.get_unchecked(0));
     assert_eq!(s0.start_time, 10000);
-    assert_eq!(s0.end_time, 11000);
+    assert_eq!(s0.end_time, 10100);
 
     let s1 = ctx.client().get_stream_state(&ids.get_unchecked(1));
     assert_eq!(s1.start_time, 10500);
-    assert_eq!(s1.cliff_time, 11000);
-    assert_eq!(s1.end_time, 12500);
+    assert_eq!(s1.cliff_time, 10600);
+    assert_eq!(s1.end_time, 10700);
 
     let s2 = ctx.client().get_stream_state(&ids.get_unchecked(2));
     assert_eq!(s2.start_time, 11000);
-    assert_eq!(s2.cliff_time, 12000);
-    assert_eq!(s2.end_time, 14000);
+    assert_eq!(s2.cliff_time, 11200);
+    assert_eq!(s2.end_time, 11300);
 
     // Verify total deposit transferred
     assert_eq!(ctx.token.balance(&ctx.sender), 4_000); // 10000 - 6000

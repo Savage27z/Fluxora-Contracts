@@ -1974,7 +1974,7 @@ impl FluxoraStream {
         recipient: Address,
         withdrawals: soroban_sdk::Vec<WithdrawToParam>,
     ) -> Result<soroban_sdk::Vec<BatchWithdrawResult>, ContractError> {
-        require_not_globally_paused(&env);
+        require_not_globally_paused(&env)?;
         recipient.require_auth();
 
         let n = withdrawals.len();
@@ -2502,7 +2502,7 @@ impl FluxoraStream {
         stream_id: u64,
         new_rate_per_second: i128,
     ) -> Result<(), ContractError> {
-        require_not_globally_paused(&env);
+        require_not_globally_paused(&env)?;
         let mut stream = load_stream(&env, stream_id)?;
 
         // Sender-only: only the original creator may reduce the rate.
@@ -2661,7 +2661,9 @@ impl FluxoraStream {
 
         let old_end_time = stream.end_time;
         let old_deposit = stream.deposit_amount;
-        let refund_amount = old_deposit - new_max_streamable;
+        let refund_amount = old_deposit
+            .checked_sub(new_max_streamable)
+            .ok_or(ContractError::ArithmeticOverflow)?;
 
         stream.end_time = new_end_time;
         stream.deposit_amount = new_max_streamable;
