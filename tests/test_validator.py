@@ -2,14 +2,12 @@
 tests/test_validator.py
 
 Test suite for script/validate-doc-alignment.py.
-Uses pytest and unittest.mock to simulate file-system states.
+Uses pytest and monkeypatch to simulate file-system states.
 Targets 95%+ code coverage of the validator module.
 """
 
 import importlib.util
-import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -30,7 +28,7 @@ def _load_module():
 vda = _load_module()
 
 # ---------------------------------------------------------------------------
-# Shared fixtures: minimal Rust source stubs and doc stubs
+# Shared source / doc stubs
 # ---------------------------------------------------------------------------
 
 MINIMAL_LIB_RS = """\
@@ -40,7 +38,6 @@ impl MyContract {
     pub fn create_stream(env: Env) -> Result<u64, Error> { Ok(0) }
     pub fn withdraw(env: Env) -> Result<i128, Error> { Ok(0) }
 }
-// allowlisted helper — must NOT be required in docs
 pub fn save_stream(env: &Env) {}
 fn private_helper() {}
 """
@@ -82,25 +79,181 @@ def _write_files(
     events: str = EVENTS_DOC,
     error: str = ERROR_DOC,
 ):
-    """Write all six files to tmp_path and return their paths."""
-    contract = tmp_path / "lib.rs"
-    ev_src = tmp_path / "events.rs"
-    err_src = tmp_path / "error.rs"
-    s_doc = tmp_path / "streaming.md"
-    e_doc = tmp_path / "events.md"
-    err_doc = tmp_path / "error.md"
+    """Write all six files to tmp_path and return their paths as a tuple."""
+    data = {
+        "lib.rs": lib_rs,
+        "events.rs": events_rs,
+        "error.rs": error_rs,
+        "streaming.md": streaming,
+        "events.md": events,
+        "error.md": error,
+    }
+    paths = {}
+    for name, content in data.items():
+        p = tmp_path / name
+        p.write_text(content, encoding="utf-8")
+        paths[name] = p
+    return (
+        paths["lib.rs"],
+        paths["events.rs"],
+        paths["error.rs"],
+        paths["streaming.md"],
+        paths["events.md"],
+        paths["error.md"],
+    )
 
-    for path, content in [
-        (contract, lib_rs),
-        (ev_src, events_rs),
-        (err_src, error_rs),
-        (s_doc, streaming),
-        (e_doc, events),
-        (err_doc, error),
-    ]:
-        path.write_text(content, encoding="utf-8")
 
-    return contract, ev_src, err_src, s_doc, e_doc, err_doc
+def _fake_mapping(tmp_path: Path, files: tuple, missing_key: str = None) -> dict:
+    """Build a MAPPING dict pointing at real tmp_path files."""
+    keys = ["CONTRACT_SRC", "EVENTS_SRC", "ERROR_SRC",
+            "DOC_STREAMING", "DOC_EVENTS", "DOC_ERROR"]
+    names = ["lib.rs", "events.rs", "error.rs",
+             "streaming.md", "events.md", "error.md"]
+    mapping = {}
+    for key, name, path in zip(keys, names, files):
+        if key == missing_key:
+            mapping[key] = (tmp_path / "no_such_file_xyz.rs",
+                            "**/no_such_file_xyz_unique.rs")
+        else:
+            mapping[key] = (path, f"**/{name}")
+    return mapping
+
+
+# ---------------------------------------------------------------------------
+# resolve_path
+# ---------------------------------------------------------------------------
+
+class TestResolvePath:
+    def test_returns_canonical_when_exists(self, tmp_path):
+        f = tmp_path / "lib.rs"
+        f.write_text("", encoding="utf-8")
+        assert vda.resolve_path("X", f, "**/*.rs") == f
+
+    def test_falls_back_to_glob(self, tmp_path):
+        sub = tmp_path / "a" / "b"
+        sub.mkdir(parents=True)
+        target = sub / "lib.rs"
+        target.write_text("", encoding="utf-8")
+        orig = vda.REPO_ROOT
+        vda.REPO_ROOT = tmp_path
+        try:
+            result = vda.resolve_path("X", tmp_path / "missing.rs", "**/lib.rs")
+        finally:
+            vda.REPO_ROOT = orig
+        assert result == target
+
+    def test_returns_none_when_both_miss(self, tmp_path):
+        orig = vda.REPO_ROOT
+        vda.REPO_ROOT = tmp_path
+        try:
+            result = vda.resolve_path("X", tmp_path / "nope.rs", "**/nope_xyz.rs")
+        finally:
+            vda.REPO_ROOT = orig
+        assert result is None
+
+    def test_glob_returns_first_sorted_match(self, tmp_path):
+        for name in ("b_lib.rs", "a_lib.rs"):
+            (tmp_path / name).write_text("", encoding="utf-8")
+        orig = vda.REPO_ROOT
+        vda.REPO_ROOT = tmp_path
+        try:
+            result = vda.resolve_path("X", tmp_path / "missing.rs", "**/*_lib.rs")
+        finally:
+            vda.REPO_ROOT = orig
+        assert result is not None
+        assert result.name == "a_lib.rs"
+
+
+# ---------------------------------------------------------------------------
+# resolve_all
+# ---------------------------------------------------------------------------
+
+class TestResolveAll:
+    def test_all_present_returns_ok(self, tmp_path, monkeypatch):
+        files = _write_files(tmp_path)
+        monkeypatch.setattr(vda, "MAPPING", _fake_mapping(tmp_path, files))
+        monkeypatch.setattr(vda, "REPO_ROOT", tmp_path)
+        resolved, ok = vda.resolve_all()
+        assert ok is True
+        assert len(resolved) == 6
+
+    def test_missing_file_returns_not_ok(self, tmp_path, monkeypatch):
+        files = _write_files(tmp_path)
+        monkeypatch.setattr(vda, "MAPPING",
+                            _fake_mapping(tmp_path, files, "CONTRACT_SRC"))
+        monkeypatch.setattr(vda, "REPO_ROOT", tmp_path)
+        _, ok = vda.resolve_all()
+        assert ok is False
+
+    def test_missing_prints_file_missing_tag(self, tmp_path, monkeypatch, capsys):
+        files = _write_files(tmp_path)
+        monkeypatch.setattr(vda, "MAPPING",
+                            _fake_mapping(tmp_path, files, "EVENTS_SRC"))
+        monkeypatch.setattr(vda, "REPO_ROOT", tmp_path)
+        vda.resolve_all()
+        assert "[FILE MISSING]:" in capsys.readouterr().out
+
+    def test_missing_prints_debug_tree(self, tmp_path, monkeypatch, capsys):
+        files = _write_files(tmp_path)
+        monkeypatch.setattr(vda, "MAPPING",
+                            _fake_mapping(tmp_path, files, "DOC_ERROR"))
+        monkeypatch.setattr(vda, "REPO_ROOT", tmp_path)
+        vda.resolve_all()
+        out = capsys.readouterr().out
+        assert "[CWD]" in out
+        assert "[ROOT]" in out
+
+    def test_no_debug_tree_when_all_present(self, tmp_path, monkeypatch, capsys):
+        files = _write_files(tmp_path)
+        monkeypatch.setattr(vda, "MAPPING", _fake_mapping(tmp_path, files))
+        monkeypatch.setattr(vda, "REPO_ROOT", tmp_path)
+        vda.resolve_all()
+        assert "[CWD]" not in capsys.readouterr().out
+
+    def test_resolved_excludes_missing_key(self, tmp_path, monkeypatch):
+        files = _write_files(tmp_path)
+        monkeypatch.setattr(vda, "MAPPING",
+                            _fake_mapping(tmp_path, files, "ERROR_SRC"))
+        monkeypatch.setattr(vda, "REPO_ROOT", tmp_path)
+        resolved, _ = vda.resolve_all()
+        assert "ERROR_SRC" not in resolved
+
+    def test_missing_message_contains_path(self, tmp_path, monkeypatch, capsys):
+        files = _write_files(tmp_path)
+        monkeypatch.setattr(vda, "MAPPING",
+                            _fake_mapping(tmp_path, files, "CONTRACT_SRC"))
+        monkeypatch.setattr(vda, "REPO_ROOT", tmp_path)
+        vda.resolve_all()
+        assert "no_such_file_xyz.rs" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# _print_debug_tree
+# ---------------------------------------------------------------------------
+
+class TestPrintDebugTree:
+    def test_prints_cwd_and_root(self, tmp_path, capsys):
+        vda._print_debug_tree(tmp_path)
+        out = capsys.readouterr().out
+        assert "[CWD]" in out
+        assert "[ROOT]" in out
+
+    def test_lists_files(self, tmp_path, capsys):
+        (tmp_path / "myfile.txt").write_text("x", encoding="utf-8")
+        vda._print_debug_tree(tmp_path)
+        assert "myfile.txt" in capsys.readouterr().out
+
+    def test_respects_max_depth(self, tmp_path, capsys):
+        deep = tmp_path / "a" / "b" / "c" / "d" / "e"
+        deep.mkdir(parents=True)
+        (deep / "deep.txt").write_text("x", encoding="utf-8")
+        vda._print_debug_tree(tmp_path, max_depth=2)
+        assert "deep.txt" not in capsys.readouterr().out
+
+    def test_directories_marked_with_slash(self, tmp_path, capsys):
+        (tmp_path / "subdir").mkdir()
+        vda._print_debug_tree(tmp_path)
+        assert "subdir/" in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------------------
@@ -116,20 +269,19 @@ class TestExtractEntrypoints:
 
     def test_allowlist_excluded(self):
         assert "save_stream" not in vda.extract_entrypoints(
-            "pub fn save_stream(env: &Env) {}"
-        )
+            "pub fn save_stream(env: &Env) {}")
 
     def test_multiple_entrypoints(self):
         src = "pub fn alpha() {}\npub fn beta() {}"
-        result = vda.extract_entrypoints(src)
-        assert {"alpha", "beta"}.issubset(result)
+        assert {"alpha", "beta"}.issubset(vda.extract_entrypoints(src))
 
     def test_indented_pub_fn(self):
-        assert "indented" in vda.extract_entrypoints("    pub fn indented(env: Env) {}")
+        assert "indented" in vda.extract_entrypoints(
+            "    pub fn indented(env: Env) {}")
 
     def test_generic_pub_fn(self):
-        # pub fn foo<T>( should also match
-        assert "generic_fn" in vda.extract_entrypoints("pub fn generic_fn<T>(x: T) {}")
+        assert "generic_fn" in vda.extract_entrypoints(
+            "pub fn generic_fn<T>(x: T) {}")
 
     def test_empty_source(self):
         assert vda.extract_entrypoints("") == set()
@@ -144,36 +296,35 @@ class TestExtractEntrypoints:
 
 class TestExtractEventSymbols:
     def test_finds_symbol_short(self):
-        src = 'Symbol::short(&env, "created")'
-        assert "created" in vda.extract_event_symbols(src)
+        assert "created" in vda.extract_event_symbols(
+            'Symbol::short(&env, "created")')
 
     def test_finds_symbol_new(self):
-        src = 'Symbol::new(&env, "withdrew")'
-        assert "withdrew" in vda.extract_event_symbols(src)
+        assert "withdrew" in vda.extract_event_symbols(
+            'Symbol::new(&env, "withdrew")')
 
     def test_finds_both_variants(self):
         src = 'Symbol::short(&env, "paused") Symbol::new(&env, "resumed")'
-        result = vda.extract_event_symbols(src)
-        assert {"paused", "resumed"}.issubset(result)
+        assert {"paused", "resumed"}.issubset(vda.extract_event_symbols(src))
 
     def test_deduplicates(self):
-        src = 'Symbol::short(&env, "created") Symbol::short(&env, "created")'
+        src = 'Symbol::short(&env, "x") Symbol::short(&env, "x")'
         assert len(vda.extract_event_symbols(src)) == 1
 
     def test_whitespace_tolerance(self):
-        src = 'Symbol::short( &env , "spaced" )'
-        assert "spaced" in vda.extract_event_symbols(src)
+        assert "spaced" in vda.extract_event_symbols(
+            'Symbol::short( &env , "spaced" )')
 
-    def test_does_not_match_symbol_short_macro(self):
-        # Old-style symbol_short!() should NOT match the new regex
-        src = 'symbol_short!("old_style")'
-        assert "old_style" not in vda.extract_event_symbols(src)
+    def test_does_not_match_old_macro_style(self):
+        assert "old_style" not in vda.extract_event_symbols(
+            'symbol_short!("old_style")')
 
     def test_empty_source(self):
         assert vda.extract_event_symbols("") == set()
 
     def test_returns_set_type(self):
-        assert isinstance(vda.extract_event_symbols('Symbol::short(&e, "x")'), set)
+        assert isinstance(
+            vda.extract_event_symbols('Symbol::short(&e, "x")'), set)
 
 
 # ---------------------------------------------------------------------------
@@ -182,9 +333,8 @@ class TestExtractEventSymbols:
 
 class TestExtractErrorVariants:
     def test_finds_variants(self):
-        src = "pub enum ContractError {\n    StreamNotFound = 1,\n    InvalidState = 2,\n}"
-        result = vda.extract_error_variants(src)
-        assert {"StreamNotFound", "InvalidState"} == result
+        src = "    StreamNotFound = 1,\n    InvalidState = 2,"
+        assert {"StreamNotFound", "InvalidState"} == vda.extract_error_variants(src)
 
     def test_ignores_lowercase_names(self):
         src = "    notAVariant = 1,\n    ValidVariant = 2,"
@@ -203,8 +353,7 @@ class TestExtractErrorVariants:
 
     def test_multiple_variants(self):
         src = "    Alpha = 1,\n    Beta = 2,\n    Gamma = 3,"
-        result = vda.extract_error_variants(src)
-        assert result == {"Alpha", "Beta", "Gamma"}
+        assert vda.extract_error_variants(src) == {"Alpha", "Beta", "Gamma"}
 
 
 # ---------------------------------------------------------------------------
@@ -216,11 +365,12 @@ class TestCheckMissing:
         assert vda.check_missing({"foo", "bar"}, "foo bar baz") == set()
 
     def test_some_missing(self):
-        assert vda.check_missing({"foo", "xyz_absent"}, "foo is here") == {"xyz_absent"}
+        assert vda.check_missing(
+            {"foo", "xyz_absent"}, "foo is here") == {"xyz_absent"}
 
     def test_all_missing(self):
-        result = vda.check_missing({"xyz_foo", "xyz_bar"}, "nothing relevant")
-        assert result == {"xyz_foo", "xyz_bar"}
+        assert vda.check_missing(
+            {"xyz_foo", "xyz_bar"}, "nothing") == {"xyz_foo", "xyz_bar"}
 
     def test_empty_identifiers(self):
         assert vda.check_missing(set(), "anything") == set()
@@ -233,154 +383,146 @@ class TestCheckMissing:
 
 
 # ---------------------------------------------------------------------------
-# validate() — integration-level tests
+# validate()
 # ---------------------------------------------------------------------------
 
 class TestValidate:
     def test_passes_on_full_alignment(self, tmp_path):
-        paths = _write_files(tmp_path)
-        assert vda.validate(*paths) == 0
+        assert vda.validate(*_write_files(tmp_path)) == 0
 
     def test_fails_on_missing_entrypoint(self, tmp_path):
-        streaming = "# Streaming\nOnly `init` is documented here.\n"
-        paths = _write_files(tmp_path, streaming=streaming)
+        paths = _write_files(
+            tmp_path,
+            streaming="# Streaming\nOnly `init` is documented here.\n")
         assert vda.validate(*paths) == 1
 
     def test_fails_on_missing_event_symbol(self, tmp_path):
-        events = "# Events\nOnly `created` is documented here.\n"
-        paths = _write_files(tmp_path, events=events)
+        paths = _write_files(
+            tmp_path,
+            events="# Events\nOnly `created` is documented here.\n")
         assert vda.validate(*paths) == 1
 
     def test_fails_on_missing_error_variant(self, tmp_path):
-        error = "# Errors\nOnly `StreamNotFound` is documented here.\n"
-        paths = _write_files(tmp_path, error=error)
+        paths = _write_files(
+            tmp_path,
+            error="# Errors\nOnly `StreamNotFound` is documented here.\n")
         assert vda.validate(*paths) == 1
 
     def test_fails_on_all_docs_drifted(self, tmp_path):
         paths = _write_files(
             tmp_path,
-            streaming="# Streaming\nno entrypoints here\n",
-            events="# Events\nno symbols here\n",
-            error="# Errors\nno variants here\n",
+            streaming="# Streaming\nno entrypoints\n",
+            events="# Events\nno symbols\n",
+            error="# Errors\nno variants\n",
         )
         assert vda.validate(*paths) == 1
 
     def test_allowlisted_entrypoint_not_required(self, tmp_path):
-        # save_stream is in lib.rs but allowlisted; docs don't need it
-        streaming = "# Streaming\n`init`, `create_stream`, `withdraw`\n"
-        paths = _write_files(tmp_path, streaming=streaming)
+        paths = _write_files(
+            tmp_path,
+            streaming="# Streaming\n`init`, `create_stream`, `withdraw`\n")
         assert vda.validate(*paths) == 0
 
     def test_prints_ok_on_success(self, tmp_path, capsys):
-        paths = _write_files(tmp_path)
-        vda.validate(*paths)
+        vda.validate(*_write_files(tmp_path))
         assert "OK:" in capsys.readouterr().out
 
     def test_prints_missing_doc_message(self, tmp_path, capsys):
-        streaming = "# Streaming\nOnly `init` is documented here.\n"
-        paths = _write_files(tmp_path, streaming=streaming)
+        paths = _write_files(
+            tmp_path,
+            streaming="# Streaming\nOnly `init` is documented here.\n")
         vda.validate(*paths)
         out = capsys.readouterr().out
         assert "MISSING DOC:" in out
         assert "streaming.md" in out
 
     def test_missing_entrypoint_message_contains_kind(self, tmp_path, capsys):
-        streaming = "# Streaming\nOnly `init` is documented here.\n"
-        paths = _write_files(tmp_path, streaming=streaming)
+        paths = _write_files(
+            tmp_path,
+            streaming="# Streaming\nOnly `init` is documented here.\n")
         vda.validate(*paths)
         assert "entrypoint" in capsys.readouterr().out
 
     def test_missing_event_message_contains_kind(self, tmp_path, capsys):
-        events = "# Events\nOnly `created` is documented here.\n"
-        paths = _write_files(tmp_path, events=events)
+        paths = _write_files(
+            tmp_path,
+            events="# Events\nOnly `created` is documented here.\n")
         vda.validate(*paths)
         assert "event symbol" in capsys.readouterr().out
 
     def test_missing_error_message_contains_kind(self, tmp_path, capsys):
-        error = "# Errors\nOnly `StreamNotFound` is documented here.\n"
-        paths = _write_files(tmp_path, error=error)
+        paths = _write_files(
+            tmp_path,
+            error="# Errors\nOnly `StreamNotFound` is documented here.\n")
         vda.validate(*paths)
         assert "error variant" in capsys.readouterr().out
 
-    def test_utf8_encoding_used(self, tmp_path):
-        # Write files with non-ASCII content to confirm utf-8 reads succeed
-        streaming = "# Streaming\n`init`, `create_stream`, `withdraw` — résumé\n"
-        paths = _write_files(tmp_path, streaming=streaming)
+    def test_utf8_encoding_roundtrip(self, tmp_path):
+        paths = _write_files(
+            tmp_path,
+            streaming="# Streaming\n`init`, `create_stream`, `withdraw` — résumé\n")
         assert vda.validate(*paths) == 0
 
     def test_path_outside_repo_root_does_not_raise(self, tmp_path, capsys):
-        # doc_path outside REPO_ROOT triggers the ValueError branch in display
-        streaming = "# Streaming\nOnly `init` is documented here.\n"
-        paths = _write_files(tmp_path, streaming=streaming)
-        # tmp_path is outside REPO_ROOT on most systems; should not raise
+        # tmp_path is outside REPO_ROOT; relative_to raises ValueError which
+        # the code handles gracefully by falling back to the full path.
+        paths = _write_files(
+            tmp_path,
+            streaming="# Streaming\nOnly `init` is documented here.\n")
         vda.validate(*paths)
         assert "MISSING DOC:" in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------------------
-# main() — file-not-found guard and happy path
+# main()
 # ---------------------------------------------------------------------------
 
 class TestMain:
-    def _patch_paths(self, monkeypatch, tmp_path, missing=None):
-        """Patch module-level path constants to point at tmp_path files."""
-        contract, ev_src, err_src, s_doc, e_doc, err_doc = _write_files(tmp_path)
-        paths = {
-            "CONTRACT_SRC": contract,
-            "EVENTS_SRC": ev_src,
-            "ERROR_SRC": err_src,
-            "DOC_STREAMING": s_doc,
-            "DOC_EVENTS": e_doc,
-            "DOC_ERROR": err_doc,
-        }
-        if missing:
-            # Replace the named path with a non-existent one
-            paths[missing] = tmp_path / "nonexistent_file.rs"
-        for attr, val in paths.items():
-            monkeypatch.setattr(vda, attr, val)
+    def _patch(self, monkeypatch, tmp_path, missing_key=None):
+        """Patch vda.MAPPING to point at tmp_path files, optionally making one missing."""
+        files = _write_files(tmp_path)
+        monkeypatch.setattr(vda, "MAPPING",
+                            _fake_mapping(tmp_path, files, missing_key))
+        monkeypatch.setattr(vda, "REPO_ROOT", tmp_path)
+
+    def test_all_aligned_returns_0(self, tmp_path, monkeypatch):
+        self._patch(monkeypatch, tmp_path)
+        assert vda.main() == 0
 
     def test_missing_contract_returns_1(self, tmp_path, monkeypatch):
-        self._patch_paths(monkeypatch, tmp_path, missing="CONTRACT_SRC")
+        self._patch(monkeypatch, tmp_path, "CONTRACT_SRC")
         assert vda.main() == 1
 
     def test_missing_events_src_returns_1(self, tmp_path, monkeypatch):
-        self._patch_paths(monkeypatch, tmp_path, missing="EVENTS_SRC")
+        self._patch(monkeypatch, tmp_path, "EVENTS_SRC")
         assert vda.main() == 1
 
     def test_missing_error_src_returns_1(self, tmp_path, monkeypatch):
-        self._patch_paths(monkeypatch, tmp_path, missing="ERROR_SRC")
+        self._patch(monkeypatch, tmp_path, "ERROR_SRC")
         assert vda.main() == 1
 
     def test_missing_streaming_doc_returns_1(self, tmp_path, monkeypatch):
-        self._patch_paths(monkeypatch, tmp_path, missing="DOC_STREAMING")
+        self._patch(monkeypatch, tmp_path, "DOC_STREAMING")
         assert vda.main() == 1
 
     def test_missing_events_doc_returns_1(self, tmp_path, monkeypatch):
-        self._patch_paths(monkeypatch, tmp_path, missing="DOC_EVENTS")
+        self._patch(monkeypatch, tmp_path, "DOC_EVENTS")
         assert vda.main() == 1
 
     def test_missing_error_doc_returns_1(self, tmp_path, monkeypatch):
-        self._patch_paths(monkeypatch, tmp_path, missing="DOC_ERROR")
+        self._patch(monkeypatch, tmp_path, "DOC_ERROR")
         assert vda.main() == 1
 
-    def test_all_files_aligned_returns_0(self, tmp_path, monkeypatch):
-        self._patch_paths(monkeypatch, tmp_path)
-        assert vda.main() == 0
-
-    def test_missing_file_prints_error(self, tmp_path, monkeypatch, capsys):
-        self._patch_paths(monkeypatch, tmp_path, missing="CONTRACT_SRC")
+    def test_missing_file_prints_file_missing_tag(
+            self, tmp_path, monkeypatch, capsys):
+        self._patch(monkeypatch, tmp_path, "CONTRACT_SRC")
         vda.main()
-        assert "ERROR:" in capsys.readouterr().out
+        assert "[FILE MISSING]:" in capsys.readouterr().out
 
     def test_drift_returns_1_via_main(self, tmp_path, monkeypatch):
-        contract, ev_src, err_src, s_doc, e_doc, err_doc = _write_files(
+        files = _write_files(
             tmp_path,
-            streaming="# Streaming\nOnly `init` is documented here.\n",
-        )
-        monkeypatch.setattr(vda, "CONTRACT_SRC", contract)
-        monkeypatch.setattr(vda, "EVENTS_SRC", ev_src)
-        monkeypatch.setattr(vda, "ERROR_SRC", err_src)
-        monkeypatch.setattr(vda, "DOC_STREAMING", s_doc)
-        monkeypatch.setattr(vda, "DOC_EVENTS", e_doc)
-        monkeypatch.setattr(vda, "DOC_ERROR", err_doc)
+            streaming="# Streaming\nOnly `init` is documented here.\n")
+        monkeypatch.setattr(vda, "MAPPING", _fake_mapping(tmp_path, files))
+        monkeypatch.setattr(vda, "REPO_ROOT", tmp_path)
         assert vda.main() == 1
