@@ -28,7 +28,9 @@ fn setup_env<'a>() -> (
 
     // Deploy native token
     let token_admin = Address::generate(&env);
-    let token_id = env.register_stellar_asset_contract(token_admin.clone());
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
     let token_client = TokenClient::new(&env, &token_id);
     let stellar_asset_client = StellarAssetClient::new(&env, &token_id);
     stellar_asset_client.mint(&sender, &100_000);
