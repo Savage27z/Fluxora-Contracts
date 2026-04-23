@@ -1,8 +1,8 @@
 extern crate std;
 
 use fluxora_stream::{
-    AutoClaimRevoked, AutoClaimSet, AutoClaimTriggered, ContractError, CreateStreamParams,
-    FluxoraStream, FluxoraStreamClient, StreamEndShortened, StreamStatus, StreamToppedUp,
+    ContractError, CreateStreamParams, FluxoraStream, FluxoraStreamClient, StreamEndShortened,
+    StreamStatus, StreamToppedUp,
 };
 use soroban_sdk::log;
 use soroban_sdk::{
@@ -3749,4 +3749,258 @@ fn test_batch_withdraw_to_contract_address_fails() {
 
     let res = ctx.client().try_batch_withdraw_to(&ctx.recipient, &params);
     assert_eq!(res, Err(Ok(fluxora_stream::ContractError::InvalidParams)));
+}
+
+// ---------------------------------------------------------------------------
+// Regression tests — #444: cancelled streams must never emit "completed" or
+// transition to Completed status, even after full withdrawal of frozen accrual.
+// ---------------------------------------------------------------------------
+
+/// Regression #444 — cancel at partial accrual, withdraw all accrued:
+/// status stays Cancelled, no "completed" event emitted.
+#[test]
+fn regression_cancelled_stream_stays_cancelled_after_full_accrual_withdrawal() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream(); // 1000 deposit, rate=1/s, end=1000
+
+    // Cancel at t=600: 600 tokens accrued, 400 refunded to sender.
+    ctx.env.ledger().set_timestamp(600);
+    ctx.client().cancel_stream(&stream_id);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Cancelled);
+    assert_eq!(state.withdrawn_amount, 0);
+
+    // Withdraw the full frozen accrual (600 tokens).
+    let events_before = ctx.env.events().all().len();
+    let withdrawn = ctx.client().withdraw(&stream_id);
+    assert_eq!(withdrawn, 600);
+
+    // Status must remain Cancelled — never Completed.
+    let state_after = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(
+        state_after.status,
+        StreamStatus::Cancelled,
+        "status must stay Cancelled after withdrawing full frozen accrual"
+    );
+    assert_eq!(state_after.withdrawn_amount, 600);
+
+    // No "completed" event must have been emitted.
+    let events = ctx.env.events().all();
+    for i in events_before..events.len() {
+        let ev = events.get(i as u32).unwrap();
+        if ev.0 != ctx.contract_id {
+            continue;
+        }
+        let topic0 = Symbol::from_val(&ctx.env, &ev.1.get(0).unwrap());
+        assert_ne!(
+            topic0,
+            Symbol::new(&ctx.env, "completed"),
+            "cancelled stream must never emit 'completed' event"
+        );
+    }
+}
+
+/// Regression #444 — cancel at 100% accrual (end_time), withdraw all:
+/// status stays Cancelled, no "completed" event emitted.
+#[test]
+fn regression_cancelled_at_end_time_stays_cancelled_no_completed_event() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream(); // 1000 deposit, rate=1/s, end=1000
+
+    // Cancel exactly at end_time: full deposit accrued, zero refund.
+    ctx.env.ledger().set_timestamp(1000);
+    ctx.client().cancel_stream(&stream_id);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Cancelled);
+
+    let events_before = ctx.env.events().all().len();
+    let withdrawn = ctx.client().withdraw(&stream_id);
+    assert_eq!(withdrawn, 1000, "all 1000 tokens must be withdrawable");
+
+    let state_after = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(
+        state_after.status,
+        StreamStatus::Cancelled,
+        "status must stay Cancelled even when withdrawn_amount == deposit_amount"
+    );
+    assert_eq!(state_after.withdrawn_amount, 1000);
+
+    let events = ctx.env.events().all();
+    let mut saw_completed = false;
+    let mut saw_withdrew = false;
+    for i in events_before..events.len() {
+        let ev = events.get(i as u32).unwrap();
+        if ev.0 != ctx.contract_id {
+            continue;
+        }
+        let topic0 = Symbol::from_val(&ctx.env, &ev.1.get(0).unwrap());
+        if topic0 == Symbol::new(&ctx.env, "completed") {
+            saw_completed = true;
+        }
+        if topic0 == Symbol::new(&ctx.env, "withdrew") {
+            saw_withdrew = true;
+        }
+    }
+    assert!(saw_withdrew, "withdrew event must still be emitted");
+    assert!(
+        !saw_completed,
+        "cancelled stream must never emit 'completed' event"
+    );
+}
+
+/// Regression #444 — cancel after partial withdrawal, then withdraw remainder:
+/// status stays Cancelled throughout, no "completed" event.
+#[test]
+fn regression_cancelled_after_partial_withdrawal_stays_cancelled() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream(); // 1000 deposit, rate=1/s, end=1000
+
+    // Withdraw 300 while active.
+    ctx.env.ledger().set_timestamp(300);
+    let w1 = ctx.client().withdraw(&stream_id);
+    assert_eq!(w1, 300);
+    assert_eq!(
+        ctx.client().get_stream_state(&stream_id).status,
+        StreamStatus::Active
+    );
+
+    // Cancel at t=700: 700 accrued total, 300 already withdrawn, 400 frozen for recipient.
+    ctx.env.ledger().set_timestamp(700);
+    ctx.client().cancel_stream(&stream_id);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Cancelled);
+    assert_eq!(state.withdrawn_amount, 300);
+
+    // Withdraw the remaining frozen accrual (400 tokens).
+    let events_before = ctx.env.events().all().len();
+    let w2 = ctx.client().withdraw(&stream_id);
+    assert_eq!(w2, 400);
+
+    let state_after = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(
+        state_after.status,
+        StreamStatus::Cancelled,
+        "status must stay Cancelled after withdrawing remaining frozen accrual"
+    );
+    assert_eq!(state_after.withdrawn_amount, 700);
+
+    // No "completed" event.
+    let events = ctx.env.events().all();
+    for i in events_before..events.len() {
+        let ev = events.get(i as u32).unwrap();
+        if ev.0 != ctx.contract_id {
+            continue;
+        }
+        let topic0 = Symbol::from_val(&ctx.env, &ev.1.get(0).unwrap());
+        assert_ne!(
+            topic0,
+            Symbol::new(&ctx.env, "completed"),
+            "cancelled stream must never emit 'completed' event"
+        );
+    }
+}
+
+/// Regression #444 — cancel immediately (zero accrual), withdraw returns 0:
+/// status stays Cancelled, no new events emitted.
+#[test]
+fn regression_cancelled_immediately_withdraw_zero_stays_cancelled() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(0);
+    ctx.client().cancel_stream(&stream_id);
+
+    let events_before = ctx.env.events().all().len();
+    let withdrawn = ctx.client().withdraw(&stream_id);
+    assert_eq!(withdrawn, 0, "nothing accrued at t=0");
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Cancelled);
+    assert_eq!(state.withdrawn_amount, 0);
+
+    // Zero-amount withdraw must emit no events.
+    let events_after = ctx.env.events().all().len();
+    assert_eq!(
+        events_after, events_before,
+        "zero-amount withdraw on cancelled stream must emit no events"
+    );
+}
+
+/// Regression #444 — admin cancel at full accrual, withdraw all:
+/// same guarantee holds for admin-initiated cancellations.
+#[test]
+fn regression_admin_cancelled_at_full_accrual_stays_cancelled() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(1000);
+    ctx.client().cancel_stream_as_admin(&stream_id);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Cancelled);
+
+    let events_before = ctx.env.events().all().len();
+    let withdrawn = ctx.client().withdraw(&stream_id);
+    assert_eq!(withdrawn, 1000);
+
+    let state_after = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(
+        state_after.status,
+        StreamStatus::Cancelled,
+        "admin-cancelled stream must stay Cancelled after full withdrawal"
+    );
+
+    let events = ctx.env.events().all();
+    for i in events_before..events.len() {
+        let ev = events.get(i as u32).unwrap();
+        if ev.0 != ctx.contract_id {
+            continue;
+        }
+        let topic0 = Symbol::from_val(&ctx.env, &ev.1.get(0).unwrap());
+        assert_ne!(
+            topic0,
+            Symbol::new(&ctx.env, "completed"),
+            "admin-cancelled stream must never emit 'completed' event"
+        );
+    }
+}
+
+/// Regression #444 — withdraw_to on cancelled stream at full accrual:
+/// status stays Cancelled, no "completed" event emitted.
+#[test]
+fn regression_cancelled_withdraw_to_stays_cancelled_no_completed_event() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(800);
+    ctx.client().cancel_stream(&stream_id);
+
+    let dest = Address::generate(&ctx.env);
+    let events_before = ctx.env.events().all().len();
+    let withdrawn = ctx.client().withdraw_to(&stream_id, &dest);
+    assert_eq!(withdrawn, 800);
+
+    let state_after = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(
+        state_after.status,
+        StreamStatus::Cancelled,
+        "withdraw_to on cancelled stream must not transition to Completed"
+    );
+
+    let events = ctx.env.events().all();
+    for i in events_before..events.len() {
+        let ev = events.get(i as u32).unwrap();
+        if ev.0 != ctx.contract_id {
+            continue;
+        }
+        let topic0 = Symbol::from_val(&ctx.env, &ev.1.get(0).unwrap());
+        assert_ne!(
+            topic0,
+            Symbol::new(&ctx.env, "completed"),
+            "cancelled stream must never emit 'completed' via withdraw_to"
+        );
+    }
 }
