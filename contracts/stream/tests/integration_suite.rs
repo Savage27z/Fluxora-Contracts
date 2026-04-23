@@ -5137,3 +5137,302 @@ fn integration_shorten_end_time_invalid_gates_exhaustive() {
         .try_shorten_stream_end_time(&stream_id, &150u64);
     assert!(result.is_ok(), "new_end_time == cliff_time should be valid");
 }
+
+// ===========================================================================
+// Issue #410 — Recipient stream index invariants
+// (sorted, unique, stable under create/withdraw/cancel/close flows)
+// ===========================================================================
+
+/// Index is sorted (ascending) after creating many streams for one recipient.
+#[test]
+fn recipient_index_is_sorted_after_multiple_creates() {
+    let ctx = TestContext::setup();
+    let sac = StellarAssetClient::new(&ctx.env, &ctx.token_id);
+    sac.mint(&ctx.sender, &100_000_i128);
+
+    ctx.env.ledger().set_timestamp(0);
+    for _ in 0..10 {
+        ctx.client().create_stream(
+            &ctx.sender,
+            &ctx.recipient,
+            &1000_i128,
+            &1_i128,
+            &0u64,
+            &0u64,
+            &1000u64,
+        );
+    }
+
+    let ids = ctx.client().get_recipient_streams(&ctx.recipient);
+    assert_eq!(ids.len(), 10);
+    for i in 1..ids.len() {
+        assert!(
+            ids.get(i - 1).unwrap() < ids.get(i).unwrap(),
+            "index must be strictly ascending at positions {} and {}",
+            i - 1,
+            i
+        );
+    }
+}
+
+/// Index contains no duplicates after batch creation.
+#[test]
+fn recipient_index_has_no_duplicates_after_batch_create() {
+    let ctx = TestContext::setup();
+    let sac = StellarAssetClient::new(&ctx.env, &ctx.token_id);
+    sac.mint(&ctx.sender, &50_000_i128);
+
+    ctx.env.ledger().set_timestamp(0);
+    let mut params = soroban_sdk::Vec::new(&ctx.env);
+    for _ in 0..8 {
+        params.push_back(CreateStreamParams {
+            recipient: ctx.recipient.clone(),
+            deposit_amount: 1000,
+            rate_per_second: 1,
+            start_time: 0,
+            cliff_time: 0,
+            end_time: 1000,
+        });
+    }
+    ctx.client().create_streams(&ctx.sender, &params);
+
+    let ids = ctx.client().get_recipient_streams(&ctx.recipient);
+    // Pairwise uniqueness check
+    for i in 0..ids.len() {
+        for j in (i + 1)..ids.len() {
+            assert_ne!(
+                ids.get(i).unwrap(),
+                ids.get(j).unwrap(),
+                "duplicate stream_id found at positions {i} and {j}"
+            );
+        }
+    }
+}
+
+/// Index count matches the number of streams created for a recipient.
+#[test]
+fn recipient_index_count_matches_created_streams() {
+    let ctx = TestContext::setup();
+    let sac = StellarAssetClient::new(&ctx.env, &ctx.token_id);
+    sac.mint(&ctx.sender, &50_000_i128);
+
+    ctx.env.ledger().set_timestamp(0);
+    for n in 1u64..=5 {
+        ctx.client().create_stream(
+            &ctx.sender,
+            &ctx.recipient,
+            &1000_i128,
+            &1_i128,
+            &0u64,
+            &0u64,
+            &1000u64,
+        );
+        assert_eq!(
+            ctx.client().get_recipient_stream_count(&ctx.recipient),
+            n,
+            "count must equal number of streams created so far"
+        );
+    }
+}
+
+/// Index is stable (unchanged) after a withdrawal that does NOT complete the stream.
+#[test]
+fn recipient_index_stable_after_partial_withdraw() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+    let id = ctx.create_default_stream();
+
+    let before = ctx.client().get_recipient_streams(&ctx.recipient);
+
+    ctx.env.ledger().set_timestamp(500);
+    ctx.client().withdraw(&id);
+
+    let after = ctx.client().get_recipient_streams(&ctx.recipient);
+    assert_eq!(before.len(), after.len());
+    assert_eq!(before.get(0).unwrap(), after.get(0).unwrap());
+}
+
+/// Index is stable after a cancel (stream stays in index until explicitly closed).
+#[test]
+fn recipient_index_stable_after_cancel() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+    let id = ctx.create_default_stream();
+
+    let before = ctx.client().get_recipient_streams(&ctx.recipient);
+
+    ctx.env.ledger().set_timestamp(300);
+    ctx.client().cancel_stream(&id);
+
+    let after = ctx.client().get_recipient_streams(&ctx.recipient);
+    assert_eq!(before.len(), after.len(), "cancel must not remove from index");
+    assert_eq!(before.get(0).unwrap(), after.get(0).unwrap());
+}
+
+/// close_completed_stream removes the stream from the recipient index.
+#[test]
+fn recipient_index_shrinks_after_close_completed_stream() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+    let id = ctx.create_default_stream();
+
+    // Complete the stream
+    ctx.env.ledger().set_timestamp(1000);
+    ctx.client().withdraw(&id);
+    assert_eq!(
+        ctx.client().get_stream_state(&id).status,
+        StreamStatus::Completed
+    );
+
+    let before_count = ctx.client().get_recipient_stream_count(&ctx.recipient);
+    ctx.client().close_completed_stream(&id);
+    let after_count = ctx.client().get_recipient_stream_count(&ctx.recipient);
+
+    assert_eq!(after_count, before_count - 1, "close must decrement index");
+
+    // The closed id must no longer appear in the index
+    let ids = ctx.client().get_recipient_streams(&ctx.recipient);
+    for i in 0..ids.len() {
+        assert_ne!(ids.get(i).unwrap(), id, "closed stream_id must not remain in index");
+    }
+}
+
+/// close_completed_stream on a cancelled stream also removes it from the index.
+#[test]
+fn recipient_index_shrinks_after_close_cancelled_stream() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+    let id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(400);
+    ctx.client().cancel_stream(&id);
+
+    let before_count = ctx.client().get_recipient_stream_count(&ctx.recipient);
+    ctx.client().close_completed_stream(&id);
+    let after_count = ctx.client().get_recipient_stream_count(&ctx.recipient);
+
+    assert_eq!(after_count, before_count - 1);
+
+    let ids = ctx.client().get_recipient_streams(&ctx.recipient);
+    for i in 0..ids.len() {
+        assert_ne!(ids.get(i).unwrap(), id);
+    }
+}
+
+/// After closing some streams the remaining index stays sorted and unique.
+#[test]
+fn recipient_index_sorted_unique_after_partial_close() {
+    let ctx = TestContext::setup();
+    let sac = StellarAssetClient::new(&ctx.env, &ctx.token_id);
+    sac.mint(&ctx.sender, &50_000_i128);
+
+    ctx.env.ledger().set_timestamp(0);
+    let mut created_ids: std::vec::Vec<u64> = std::vec::Vec::new();
+    for _ in 0..6 {
+        let id = ctx.client().create_stream(
+            &ctx.sender,
+            &ctx.recipient,
+            &1000_i128,
+            &1_i128,
+            &0u64,
+            &0u64,
+            &1000u64,
+        );
+        created_ids.push(id);
+    }
+
+    // Complete and close the even-indexed streams (0, 2, 4)
+    ctx.env.ledger().set_timestamp(1000);
+    for &id in created_ids.iter().step_by(2) {
+        ctx.client().withdraw(&id);
+        ctx.client().close_completed_stream(&id);
+    }
+
+    let ids = ctx.client().get_recipient_streams(&ctx.recipient);
+    assert_eq!(ids.len(), 3, "three streams should remain");
+
+    // Sorted
+    for i in 1..ids.len() {
+        assert!(ids.get(i - 1).unwrap() < ids.get(i).unwrap());
+    }
+    // Unique
+    for i in 0..ids.len() {
+        for j in (i + 1)..ids.len() {
+            assert_ne!(ids.get(i).unwrap(), ids.get(j).unwrap());
+        }
+    }
+}
+
+/// Multiple recipients each have independent, correct indices.
+#[test]
+fn recipient_index_independent_per_recipient() {
+    let ctx = TestContext::setup();
+    let sac = StellarAssetClient::new(&ctx.env, &ctx.token_id);
+    sac.mint(&ctx.sender, &100_000_i128);
+
+    let alice = Address::generate(&ctx.env);
+    let bob = Address::generate(&ctx.env);
+
+    ctx.env.ledger().set_timestamp(0);
+    // 3 streams for alice, 5 for bob
+    for _ in 0..3 {
+        ctx.client().create_stream(
+            &ctx.sender,
+            &alice,
+            &1000_i128,
+            &1_i128,
+            &0u64,
+            &0u64,
+            &1000u64,
+        );
+    }
+    for _ in 0..5 {
+        ctx.client().create_stream(
+            &ctx.sender,
+            &bob,
+            &1000_i128,
+            &1_i128,
+            &0u64,
+            &0u64,
+            &1000u64,
+        );
+    }
+
+    assert_eq!(ctx.client().get_recipient_stream_count(&alice), 3);
+    assert_eq!(ctx.client().get_recipient_stream_count(&bob), 5);
+
+    // Alice's ids must not appear in Bob's index and vice-versa
+    let alice_ids = ctx.client().get_recipient_streams(&alice);
+    let bob_ids = ctx.client().get_recipient_streams(&bob);
+    for i in 0..alice_ids.len() {
+        let aid = alice_ids.get(i).unwrap();
+        for j in 0..bob_ids.len() {
+            assert_ne!(aid, bob_ids.get(j).unwrap(), "alice and bob must not share stream ids");
+        }
+    }
+}
+
+/// Post-close reads: get_stream_state returns StreamNotFound for a closed stream.
+#[test]
+fn post_close_get_stream_state_returns_not_found() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+    let id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(1000);
+    ctx.client().withdraw(&id);
+    ctx.client().close_completed_stream(&id);
+
+    let result = ctx.client().try_get_stream_state(&id);
+    assert_eq!(result, Err(Ok(ContractError::StreamNotFound)));
+}
+
+/// get_recipient_streams returns empty for an address with no streams.
+#[test]
+fn recipient_index_empty_for_unknown_address() {
+    let ctx = TestContext::setup();
+    let stranger = Address::generate(&ctx.env);
+    let ids = ctx.client().get_recipient_streams(&stranger);
+    assert_eq!(ids.len(), 0);
+    assert_eq!(ctx.client().get_recipient_stream_count(&stranger), 0);
+}
