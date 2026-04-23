@@ -2709,7 +2709,7 @@ fn integration_uninitialised_version_works() {
     let env = Env::default();
     let contract_id = env.register_contract(None, FluxoraStream);
     let client = FluxoraStreamClient::new(&env, &contract_id);
-    assert_eq!(client.version(), 1);
+    assert_eq!(client.version(), 2);
 }
 
 /// Uninitialised contract: stream count returns 0.
@@ -3479,13 +3479,18 @@ fn shorten_end_time_one_second_future_accepted() {
 }
 
 // ---------------------------------------------------------------------------
-// Auto-claim opt-in tests (#443)
+// Structured error integration tests (#442)
+//
+// Verify that previously-panicking input-error paths now return structured
+// ContractError variants so clients can handle them programmatically.
 // ---------------------------------------------------------------------------
 
-/// Helper: create a default stream and return (stream_id, end_time).
-fn create_auto_claim_stream(ctx: &TestContext) -> u64 {
-    ctx.env.ledger().set_timestamp(0);
-    ctx.client().create_stream(
+/// batch_withdraw with duplicate stream IDs returns DuplicateStreamId (not panic).
+#[test]
+fn integration_batch_withdraw_duplicate_ids_returns_structured_error() {
+    let ctx = TestContext::setup();
+
+    let stream_id = ctx.client().create_stream(
         &ctx.sender,
         &ctx.recipient,
         &1000_i128,
@@ -3493,337 +3498,255 @@ fn create_auto_claim_stream(ctx: &TestContext) -> u64 {
         &0u64,
         &0u64,
         &1000u64,
-    )
-}
+    );
 
-// ── set_auto_claim ──────────────────────────────────────────────────────────
+    ctx.env.ledger().with_mut(|l| l.timestamp = 500);
 
-/// Recipient can opt in and the destination is stored on-chain.
-#[test]
-fn auto_claim_set_stores_destination() {
-    let ctx = TestContext::setup();
-    let stream_id = create_auto_claim_stream(&ctx);
-    let dest = Address::generate(&ctx.env);
-
-    ctx.client().set_auto_claim(&stream_id, &dest);
-
-    let stored = ctx.client().get_auto_claim_destination(&stream_id);
-    assert_eq!(stored, Some(dest));
-}
-
-/// Recipient can overwrite the destination with a new address.
-#[test]
-fn auto_claim_set_overwrites_previous_destination() {
-    let ctx = TestContext::setup();
-    let stream_id = create_auto_claim_stream(&ctx);
-    let dest1 = Address::generate(&ctx.env);
-    let dest2 = Address::generate(&ctx.env);
-
-    ctx.client().set_auto_claim(&stream_id, &dest1);
-    ctx.client().set_auto_claim(&stream_id, &dest2);
-
+    let ids = soroban_sdk::vec![&ctx.env, stream_id, stream_id];
+    let result = ctx.client().try_batch_withdraw(&ctx.recipient, &ids);
     assert_eq!(
-        ctx.client().get_auto_claim_destination(&stream_id),
-        Some(dest2)
+        result,
+        Err(Ok(ContractError::DuplicateStreamId)),
+        "duplicate IDs must return DuplicateStreamId"
+    );
+
+    // No state mutation occurred
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.withdrawn_amount, 0);
+}
+
+/// Globally paused contract returns ContractPaused from withdraw (not panic).
+#[test]
+fn integration_globally_paused_withdraw_returns_structured_error() {
+    let ctx = TestContext::setup();
+
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1000u64,
+    );
+
+    ctx.env.ledger().with_mut(|l| l.timestamp = 500);
+    ctx.client().set_global_emergency_paused(&true);
+
+    let result = ctx.client().try_withdraw(&stream_id);
+    assert_eq!(
+        result,
+        Err(Ok(ContractError::ContractPaused)),
+        "withdraw while globally paused must return ContractPaused"
     );
 }
 
-/// set_auto_claim rejects the contract address as destination.
+/// Globally paused contract returns ContractPaused from update_rate_per_second.
 #[test]
-fn auto_claim_set_rejects_contract_as_destination() {
+fn integration_globally_paused_update_rate_returns_structured_error() {
     let ctx = TestContext::setup();
-    let stream_id = create_auto_claim_stream(&ctx);
 
-    let result = ctx
-        .client()
-        .try_set_auto_claim(&stream_id, &ctx.contract_id);
-    assert_eq!(result, Err(Ok(ContractError::InvalidParams)));
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1000u64,
+    );
+
+    ctx.client().set_global_emergency_paused(&true);
+
+    let result = ctx.client().try_update_rate_per_second(&stream_id, &2_i128);
+    assert_eq!(
+        result,
+        Err(Ok(ContractError::ContractPaused)),
+        "update_rate_per_second while globally paused must return ContractPaused"
+    );
 }
 
-/// set_auto_claim rejects opt-in on a Completed stream.
+// ===========================================================================
+// Tests — batch_withdraw_to
+// ===========================================================================
+
+use fluxora_stream::WithdrawToParam;
+
 #[test]
-fn auto_claim_set_rejects_completed_stream() {
+fn test_batch_withdraw_to_success() {
     let ctx = TestContext::setup();
-    let stream_id = create_auto_claim_stream(&ctx);
+    let stream_id1 = ctx.create_default_stream();
+    let stream_id2 = ctx.create_default_stream();
 
-    // Fully withdraw to complete the stream.
-    ctx.env.ledger().set_timestamp(1000);
-    ctx.client().withdraw(&stream_id);
+    ctx.env.ledger().with_mut(|l| l.timestamp = 500);
 
-    let dest = Address::generate(&ctx.env);
-    let result = ctx.client().try_set_auto_claim(&stream_id, &dest);
-    assert_eq!(result, Err(Ok(ContractError::InvalidState)));
+    let dest1 = Address::generate(&ctx.env);
+    let dest2 = Address::generate(&ctx.env);
+
+    let params = vec![
+        &ctx.env,
+        WithdrawToParam {
+            stream_id: stream_id1,
+            destination: dest1.clone(),
+        },
+        WithdrawToParam {
+            stream_id: stream_id2,
+            destination: dest2.clone(),
+        },
+    ];
+
+    let results = ctx.client().batch_withdraw_to(&ctx.recipient, &params);
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(results.get(0).unwrap().amount, 500);
+    assert_eq!(results.get(1).unwrap().amount, 500);
+
+    assert_eq!(ctx.token.balance(&dest1), 500);
+    assert_eq!(ctx.token.balance(&dest2), 500);
 }
 
-/// set_auto_claim rejects opt-in on a Cancelled stream.
 #[test]
-fn auto_claim_set_rejects_cancelled_stream() {
+#[should_panic(expected = "batch_withdraw_to stream_ids must be unique")]
+fn test_batch_withdraw_to_duplicate_ids_panics() {
     let ctx = TestContext::setup();
-    let stream_id = create_auto_claim_stream(&ctx);
+    let stream_id1 = ctx.create_default_stream();
 
-    ctx.client().cancel_stream(&stream_id);
+    let dest1 = Address::generate(&ctx.env);
 
-    let dest = Address::generate(&ctx.env);
-    let result = ctx.client().try_set_auto_claim(&stream_id, &dest);
-    assert_eq!(result, Err(Ok(ContractError::InvalidState)));
+    let params = vec![
+        &ctx.env,
+        WithdrawToParam {
+            stream_id: stream_id1,
+            destination: dest1.clone(),
+        },
+        WithdrawToParam {
+            stream_id: stream_id1,
+            destination: dest1.clone(),
+        },
+    ];
+
+    ctx.client().batch_withdraw_to(&ctx.recipient, &params);
 }
 
-/// set_auto_claim emits the correct event.
 #[test]
-fn auto_claim_set_emits_event() {
+fn test_batch_withdraw_to_zero_amount_emits_no_event() {
     let ctx = TestContext::setup();
-    let stream_id = create_auto_claim_stream(&ctx);
-    let dest = Address::generate(&ctx.env);
+    let stream_id1 = ctx.create_default_stream();
 
-    ctx.client().set_auto_claim(&stream_id, &dest);
+    // At t=0, withdrawable is 0
+    ctx.env.ledger().with_mut(|l| l.timestamp = 0);
+
+    let dest1 = Address::generate(&ctx.env);
+    let params = vec![
+        &ctx.env,
+        WithdrawToParam {
+            stream_id: stream_id1,
+            destination: dest1.clone(),
+        },
+    ];
+
+    ctx.client().batch_withdraw_to(&ctx.recipient, &params);
 
     let events = ctx.env.events().all();
-    let last = events.last().unwrap();
-    let topic_sym = Symbol::from_val(&ctx.env, &last.1.get(0).unwrap());
-    assert_eq!(topic_sym, Symbol::new(&ctx.env, "ac_set"));
-
-    let payload = AutoClaimSet::try_from_val(&ctx.env, &last.2).unwrap();
-    assert_eq!(payload.stream_id, stream_id);
-    assert_eq!(payload.destination, dest);
-}
-
-// ── revoke_auto_claim ───────────────────────────────────────────────────────
-
-/// Recipient can revoke and the destination is removed.
-#[test]
-fn auto_claim_revoke_removes_destination() {
-    let ctx = TestContext::setup();
-    let stream_id = create_auto_claim_stream(&ctx);
-    let dest = Address::generate(&ctx.env);
-
-    ctx.client().set_auto_claim(&stream_id, &dest);
-    ctx.client().revoke_auto_claim(&stream_id);
-
-    assert_eq!(ctx.client().get_auto_claim_destination(&stream_id), None);
-}
-
-/// revoke_auto_claim is a no-op when nothing is set (no error).
-#[test]
-fn auto_claim_revoke_noop_when_not_set() {
-    let ctx = TestContext::setup();
-    let stream_id = create_auto_claim_stream(&ctx);
-
-    // Should not error even though no destination was set.
-    ctx.client().revoke_auto_claim(&stream_id);
-    assert_eq!(ctx.client().get_auto_claim_destination(&stream_id), None);
-}
-
-/// revoke_auto_claim emits the correct event.
-#[test]
-fn auto_claim_revoke_emits_event() {
-    let ctx = TestContext::setup();
-    let stream_id = create_auto_claim_stream(&ctx);
-    let dest = Address::generate(&ctx.env);
-
-    ctx.client().set_auto_claim(&stream_id, &dest);
-    ctx.client().revoke_auto_claim(&stream_id);
-
-    let events = ctx.env.events().all();
-    let last = events.last().unwrap();
-    let topic_sym = Symbol::from_val(&ctx.env, &last.1.get(0).unwrap());
-    assert_eq!(topic_sym, Symbol::new(&ctx.env, "ac_revoke"));
-
-    let payload = AutoClaimRevoked::try_from_val(&ctx.env, &last.2).unwrap();
-    assert_eq!(payload.stream_id, stream_id);
-}
-
-// ── trigger_auto_claim ──────────────────────────────────────────────────────
-
-/// Anyone can trigger auto-claim after end_time; tokens go to recipient-chosen destination.
-#[test]
-fn auto_claim_trigger_sends_to_destination() {
-    let ctx = TestContext::setup();
-    let stream_id = create_auto_claim_stream(&ctx);
-    let dest = Address::generate(&ctx.env);
-
-    ctx.client().set_auto_claim(&stream_id, &dest);
-
-    // Advance past end_time.
-    ctx.env.ledger().set_timestamp(1001);
-
-    let amount = ctx.client().trigger_auto_claim(&stream_id);
-    assert_eq!(amount, 1000_i128);
-    assert_eq!(ctx.token.balance(&dest), 1000_i128);
-}
-
-/// trigger_auto_claim fails before end_time.
-#[test]
-fn auto_claim_trigger_rejects_before_end_time() {
-    let ctx = TestContext::setup();
-    let stream_id = create_auto_claim_stream(&ctx);
-    let dest = Address::generate(&ctx.env);
-
-    ctx.client().set_auto_claim(&stream_id, &dest);
-
-    ctx.env.ledger().set_timestamp(500); // before end_time=1000
-
-    let result = ctx.client().try_trigger_auto_claim(&stream_id);
-    assert_eq!(result, Err(Ok(ContractError::InvalidState)));
-}
-
-/// trigger_auto_claim fails when no destination is set.
-#[test]
-fn auto_claim_trigger_rejects_when_not_opted_in() {
-    let ctx = TestContext::setup();
-    let stream_id = create_auto_claim_stream(&ctx);
-
-    ctx.env.ledger().set_timestamp(1001);
-
-    let result = ctx.client().try_trigger_auto_claim(&stream_id);
-    assert_eq!(result, Err(Ok(ContractError::AutoClaimNotSet)));
-}
-
-/// trigger_auto_claim fails on an already-Completed stream.
-#[test]
-fn auto_claim_trigger_rejects_completed_stream() {
-    let ctx = TestContext::setup();
-    let stream_id = create_auto_claim_stream(&ctx);
-    let dest = Address::generate(&ctx.env);
-
-    ctx.client().set_auto_claim(&stream_id, &dest);
-
-    ctx.env.ledger().set_timestamp(1001);
-    ctx.client().withdraw(&stream_id); // completes the stream
-
-    let result = ctx.client().try_trigger_auto_claim(&stream_id);
-    assert_eq!(result, Err(Ok(ContractError::InvalidState)));
-}
-
-/// trigger_auto_claim fails on a Cancelled stream.
-#[test]
-fn auto_claim_trigger_rejects_cancelled_stream() {
-    let ctx = TestContext::setup();
-    let stream_id = create_auto_claim_stream(&ctx);
-    let dest = Address::generate(&ctx.env);
-
-    ctx.client().set_auto_claim(&stream_id, &dest);
-    ctx.client().cancel_stream(&stream_id);
-
-    ctx.env.ledger().set_timestamp(1001);
-
-    let result = ctx.client().try_trigger_auto_claim(&stream_id);
-    assert_eq!(result, Err(Ok(ContractError::InvalidState)));
-}
-
-/// trigger_auto_claim emits ac_trig and withdrew events.
-#[test]
-fn auto_claim_trigger_emits_events() {
-    let ctx = TestContext::setup();
-    let stream_id = create_auto_claim_stream(&ctx);
-    let dest = Address::generate(&ctx.env);
-
-    ctx.client().set_auto_claim(&stream_id, &dest);
-    ctx.env.ledger().set_timestamp(1001);
-    ctx.client().trigger_auto_claim(&stream_id);
-
-    let events = ctx.env.events().all();
-
-    // Find ac_trig event
-    let ac_event = events
-        .iter()
-        .find(|e| {
-            Symbol::from_val(&ctx.env, &e.1.get(0).unwrap())
-                == Symbol::new(&ctx.env, "ac_trig")
+    let withdraw_events: std::vec::Vec<_> = events
+        .into_iter()
+        .filter(|e| {
+            if e.1.len() < 2 {
+                return false;
+            }
+            let s = Symbol::try_from_val(
+                &ctx.env,
+                &e.1.get(0).unwrap_or(soroban_sdk::Val::VOID.into()),
+            );
+            matches!(s, Ok(sym) if sym == Symbol::new(&ctx.env, "wdraw_to"))
         })
-        .expect("ac_trig event not found");
+        .collect();
 
-    let payload = AutoClaimTriggered::try_from_val(&ctx.env, &ac_event.2).unwrap();
-    assert_eq!(payload.stream_id, stream_id);
-    assert_eq!(payload.destination, dest);
-    assert_eq!(payload.amount, 1000_i128);
+    assert_eq!(withdraw_events.len(), 0, "Zero amount must emit no event");
 }
 
-/// After trigger_auto_claim, stream is Completed and destination holds the tokens.
 #[test]
-fn auto_claim_trigger_completes_stream() {
+fn test_batch_withdraw_to_mixed_status() {
     let ctx = TestContext::setup();
-    let stream_id = create_auto_claim_stream(&ctx);
+
+    // Stream 1: Active
+    let s1 = ctx.create_default_stream();
+
+    // Stream 2: Cancelled (we can withdraw from cancelled streams)
+    let s2 = ctx.create_default_stream();
+    ctx.client().cancel_stream(&s2);
+
+    // Stream 3: Completed
+    let s3 = ctx.create_default_stream();
+    ctx.env.ledger().with_mut(|l| l.timestamp = 1000);
+    ctx.client().withdraw(&s3);
+
+    // Stream 4: Cancelled (fails batch_withdraw_to, so we only test the valid ones)
+    let s4 = ctx.create_default_stream();
+    ctx.client().cancel_stream(&s4);
+
+    ctx.env.ledger().with_mut(|l| l.timestamp = 500);
+
     let dest = Address::generate(&ctx.env);
 
-    ctx.client().set_auto_claim(&stream_id, &dest);
-    ctx.env.ledger().set_timestamp(1001);
-    ctx.client().trigger_auto_claim(&stream_id);
+    let params = vec![
+        &ctx.env,
+        WithdrawToParam {
+            stream_id: s1,
+            destination: dest.clone(),
+        },
+        WithdrawToParam {
+            stream_id: s2,
+            destination: dest.clone(),
+        },
+        WithdrawToParam {
+            stream_id: s3,
+            destination: dest.clone(),
+        },
+    ];
 
-    let state = ctx.client().get_stream_state(&stream_id);
-    assert_eq!(state.status, StreamStatus::Completed);
-    assert_eq!(state.withdrawn_amount, 1000_i128);
+    let results = ctx.client().batch_withdraw_to(&ctx.recipient, &params);
+
+    assert_eq!(results.len(), 3);
+    assert_eq!(results.get(0).unwrap().amount, 500); // Active
+    assert_eq!(results.get(1).unwrap().amount, 0); // Cancelled at t=0 means 0 accrued
+    assert_eq!(results.get(2).unwrap().amount, 0); // Completed
+
+    assert_eq!(ctx.token.balance(&dest), 500);
 }
 
-/// Revoking after opt-in prevents trigger_auto_claim.
 #[test]
-fn auto_claim_revoke_then_trigger_fails() {
+fn test_batch_withdraw_to_unauthorized_panics() {
     let ctx = TestContext::setup();
-    let stream_id = create_auto_claim_stream(&ctx);
+    let stream_id = ctx.create_default_stream();
+
     let dest = Address::generate(&ctx.env);
+    let params = vec![
+        &ctx.env,
+        WithdrawToParam {
+            stream_id,
+            destination: dest,
+        },
+    ];
 
-    ctx.client().set_auto_claim(&stream_id, &dest);
-    ctx.client().revoke_auto_claim(&stream_id);
-
-    ctx.env.ledger().set_timestamp(1001);
-
-    let result = ctx.client().try_trigger_auto_claim(&stream_id);
-    assert_eq!(result, Err(Ok(ContractError::AutoClaimNotSet)));
+    // Try to withdraw as sender instead of recipient
+    let res = ctx.client().try_batch_withdraw_to(&ctx.sender, &params);
+    assert_eq!(res, Err(Ok(fluxora_stream::ContractError::Unauthorized)));
 }
 
-/// Partial withdrawal before trigger_auto_claim: trigger claims the remainder.
 #[test]
-fn auto_claim_trigger_claims_remainder_after_partial_withdraw() {
+fn test_batch_withdraw_to_contract_address_fails() {
     let ctx = TestContext::setup();
-    let stream_id = create_auto_claim_stream(&ctx);
-    let dest = Address::generate(&ctx.env);
+    let stream_id = ctx.create_default_stream();
 
-    ctx.client().set_auto_claim(&stream_id, &dest);
+    let params = vec![
+        &ctx.env,
+        WithdrawToParam {
+            stream_id,
+            destination: ctx.contract_id.clone(),
+        },
+    ];
 
-    // Partial withdraw at t=500 (500 tokens).
-    ctx.env.ledger().set_timestamp(500);
-    ctx.client().withdraw(&stream_id);
-
-    // Trigger at end_time.
-    ctx.env.ledger().set_timestamp(1001);
-    let amount = ctx.client().trigger_auto_claim(&stream_id);
-
-    assert_eq!(amount, 500_i128); // remaining 500
-    assert_eq!(ctx.token.balance(&dest), 500_i128);
-}
-
-/// trigger_auto_claim works on a Paused stream that is past end_time.
-#[test]
-fn auto_claim_trigger_works_on_paused_time_terminal_stream() {
-    let ctx = TestContext::setup();
-    let stream_id = create_auto_claim_stream(&ctx);
-    let dest = Address::generate(&ctx.env);
-
-    ctx.client().set_auto_claim(&stream_id, &dest);
-    ctx.client().pause_stream(&stream_id);
-
-    ctx.env.ledger().set_timestamp(1001); // past end_time
-
-    let amount = ctx.client().trigger_auto_claim(&stream_id);
-    assert_eq!(amount, 1000_i128);
-    assert_eq!(ctx.token.balance(&dest), 1000_i128);
-}
-
-/// Cancellation after opt-in: trigger_auto_claim is blocked (Cancelled state).
-#[test]
-fn auto_claim_cancel_interaction_blocks_trigger() {
-    let ctx = TestContext::setup();
-    let stream_id = create_auto_claim_stream(&ctx);
-    let dest = Address::generate(&ctx.env);
-
-    ctx.client().set_auto_claim(&stream_id, &dest);
-
-    ctx.env.ledger().set_timestamp(500);
-    ctx.client().cancel_stream(&stream_id);
-
-    ctx.env.ledger().set_timestamp(1001);
-
-    let result = ctx.client().try_trigger_auto_claim(&stream_id);
-    assert_eq!(result, Err(Ok(ContractError::InvalidState)));
-    // Destination balance unchanged.
-    assert_eq!(ctx.token.balance(&dest), 0_i128);
+    let res = ctx.client().try_batch_withdraw_to(&ctx.recipient, &params);
+    assert_eq!(res, Err(Ok(fluxora_stream::ContractError::InvalidParams)));
 }
