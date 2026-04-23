@@ -60,6 +60,8 @@ From **CONTRACT_VERSION 3**, integrators can register **relative** schedule skel
 Terminal states: `Completed`, `Cancelled`. Both may be closed via `close_completed_stream` to reclaim storage and index space. A stream is also considered technically terminal if `ledger.timestamp() >= end_time`.
 In this "time-terminal" state, pause/resume is blocked, but withdrawal is always allowed regardless of previous pause status.
 
+**Cancelled stream closure rule**: A `Cancelled` stream may only be closed after the recipient has fully withdrawn the frozen accrued amount. Attempting to close a `Cancelled` stream with remaining claimable balance returns `ContractError::InvalidState`. This prevents storage cleanup from destroying recipient funds.
+
 ### Cancellation Semantics (Issue Scope)
 
 This section is the protocol-level contract for `cancel_stream` and `cancel_stream_as_admin`.
@@ -890,6 +892,7 @@ errors relevant to stream creation and timing.
 | `ContractError::InvalidState` (2)                                       | `withdraw`                         | Withdraw from non-terminal paused             |
 | `ContractError::InvalidState` (2)                                       | `cancel_stream`                    | Cancel completed/cancelled                    |
 | `"invalid state for stream closure"`                                    | `close_completed_stream`           | Close non-terminal (Active/Paused) stream    |
+| `ContractError::InvalidState` (2)                                       | `close_completed_stream`           | Close Cancelled stream with remaining claimable balance |
 | `"contract not initialised: missing config"`                            | Functions requiring config         | Config missing                                |
 
 ## Error Reference

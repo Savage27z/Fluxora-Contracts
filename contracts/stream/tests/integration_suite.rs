@@ -4020,3 +4020,168 @@ fn ttl_config_survives_long_operation_sequence() {
 }
 
 }
+
+// ---------------------------------------------------------------------------
+// close_completed_stream — cancelled stream settlement tests (issue #439)
+// ---------------------------------------------------------------------------
+
+/// Closing a cancelled stream with remaining claimable balance must fail.
+#[test]
+fn close_cancelled_stream_with_remaining_claim_fails() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream(); // 1000 tokens, rate=1, end=1000
+
+    // Cancel at t=500 — recipient has 500 tokens to claim
+    ctx.env.ledger().set_timestamp(500);
+    ctx.client().cancel_stream(&stream_id);
+
+    // Attempt to close before recipient withdraws — must fail
+    let result = ctx.client().try_close_completed_stream(&stream_id);
+    assert_eq!(result, Err(Ok(ContractError::InvalidState)));
+
+    // Stream must still exist
+    let stream = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(stream.status, StreamStatus::Cancelled);
+}
+
+/// Closing a cancelled stream after the recipient fully withdraws must succeed.
+#[test]
+fn close_cancelled_stream_after_full_withdrawal_succeeds() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(500);
+    ctx.client().cancel_stream(&stream_id);
+
+    // Recipient withdraws the frozen 500 tokens
+    ctx.client().withdraw(&stream_id);
+    assert_eq!(ctx.token.balance(&ctx.recipient), 500);
+
+    // Now close is allowed
+    ctx.client().close_completed_stream(&stream_id);
+
+    // Stream must be gone
+    let result = ctx.client().try_get_stream_state(&stream_id);
+    assert_eq!(result, Err(Ok(ContractError::StreamNotFound)));
+}
+
+/// Closing a cancelled stream with zero accrual (cancelled before cliff) succeeds immediately.
+#[test]
+fn close_cancelled_stream_before_cliff_no_claim_needed() {
+    let ctx = TestContext::setup();
+
+    // Stream with cliff at t=500
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,
+        &500u64, // cliff
+        &1000u64,
+    );
+
+    // Cancel at t=100 — before cliff, so accrued=0, claimable=0
+    ctx.env.ledger().set_timestamp(100);
+    ctx.client().cancel_stream(&stream_id);
+
+    // Close immediately — no withdrawal needed
+    ctx.client().close_completed_stream(&stream_id);
+
+    let result = ctx.client().try_get_stream_state(&stream_id);
+    assert_eq!(result, Err(Ok(ContractError::StreamNotFound)));
+}
+
+/// Closing a cancelled stream after partial withdrawal fails if balance remains.
+#[test]
+fn close_cancelled_stream_partial_withdrawal_fails() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(600);
+    ctx.client().cancel_stream(&stream_id);
+
+    // Recipient withdraws only 300 of the 600 frozen tokens
+    // (simulate by advancing time to 300 and withdrawing, then cancelling at 600)
+    // Re-create scenario: cancel at 600, withdraw at 600 gets 600 tokens
+    // For partial: we need a stream where recipient withdraws before cancel
+    // Use a fresh stream: withdraw 200 at t=200, cancel at t=600 → claimable=400
+    let ctx2 = TestContext::setup();
+    let sid2 = ctx2.create_default_stream();
+
+    ctx2.env.ledger().set_timestamp(200);
+    ctx2.client().withdraw(&sid2); // withdraw 200
+
+    ctx2.env.ledger().set_timestamp(600);
+    ctx2.client().cancel_stream(&sid2); // accrued=600, withdrawn=200, claimable=400
+
+    // Close must fail — 400 tokens still claimable
+    let result = ctx2.client().try_close_completed_stream(&sid2);
+    assert_eq!(result, Err(Ok(ContractError::InvalidState)));
+}
+
+/// Closing a cancelled stream after full withdrawal removes recipient index entry.
+#[test]
+fn close_cancelled_stream_removes_recipient_index() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(500);
+    ctx.client().cancel_stream(&stream_id);
+    ctx.client().withdraw(&stream_id);
+
+    // Confirm stream is in recipient index before close
+    let streams_before = ctx.client().get_recipient_streams(&ctx.recipient);
+    assert!(streams_before.contains(stream_id));
+
+    ctx.client().close_completed_stream(&stream_id);
+
+    // Confirm stream removed from recipient index
+    let streams_after = ctx.client().get_recipient_streams(&ctx.recipient);
+    assert!(!streams_after.contains(stream_id));
+}
+
+/// Closing a completed (not cancelled) stream is unaffected by the new guard.
+#[test]
+fn close_completed_stream_still_works() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(1000);
+    ctx.client().withdraw(&stream_id); // fully drains → Completed
+
+    let stream = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(stream.status, StreamStatus::Completed);
+
+    ctx.client().close_completed_stream(&stream_id);
+
+    let result = ctx.client().try_get_stream_state(&stream_id);
+    assert_eq!(result, Err(Ok(ContractError::StreamNotFound)));
+}
+
+/// Closing an active stream still fails.
+#[test]
+fn close_active_stream_still_fails() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    let result = ctx.client().try_close_completed_stream(&stream_id);
+    assert_eq!(result, Err(Ok(ContractError::InvalidState)));
+}
+
+/// Idempotency: closing an already-closed cancelled stream returns StreamNotFound.
+#[test]
+fn close_cancelled_stream_double_close_returns_not_found() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(500);
+    ctx.client().cancel_stream(&stream_id);
+    ctx.client().withdraw(&stream_id);
+    ctx.client().close_completed_stream(&stream_id);
+
+    // Second close: stream is gone
+    let result = ctx.client().try_close_completed_stream(&stream_id);
+    assert_eq!(result, Err(Ok(ContractError::StreamNotFound)));
+}
