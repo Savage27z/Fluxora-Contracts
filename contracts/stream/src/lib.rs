@@ -2897,9 +2897,29 @@ impl FluxoraStream {
         let stream = load_stream(&env, stream_id)?;
 
         // Only explicitly terminal streams (Completed or Cancelled) can be closed.
-        // Completed: fully withdrawn. Cancelled: refunded and terminated.
         if stream.status != StreamStatus::Completed && stream.status != StreamStatus::Cancelled {
             return Err(ContractError::InvalidState);
+        }
+
+        // For Cancelled streams, prove no claimable balance remains before removing.
+        // Accrual is frozen at cancelled_at; the recipient may still withdraw the frozen amount.
+        // Closing before full settlement would destroy recipient funds.
+        if stream.status == StreamStatus::Cancelled {
+            let cancelled_at = stream.cancelled_at.ok_or(ContractError::InvalidState)?;
+            let accrued = accrual::calculate_accrued_amount_checkpointed(
+                stream.start_time,
+                stream.checkpointed_amount,
+                stream.checkpointed_at,
+                stream.cliff_time,
+                stream.end_time,
+                stream.rate_per_second,
+                stream.deposit_amount,
+                cancelled_at,
+            );
+            let claimable = accrued.saturating_sub(stream.withdrawn_amount).max(0);
+            if claimable > 0 {
+                return Err(ContractError::InvalidState);
+            }
         }
 
         env.events().publish(

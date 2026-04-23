@@ -123,6 +123,7 @@ Extended on every `load_stream()` (read) and `save_stream()` (write), and on eve
 ### TTL implications for operators
 
 - **Active streams**: TTL refreshed on any interaction.
+- **Cancelled streams**: Remain in persistent storage until the recipient withdraws the frozen accrued amount. `close_completed_stream` is blocked while any claimable balance remains. Operators must ensure recipients are notified to withdraw before TTL expiry.
 - **Inactive streams**: May expire after ~7 days with zero interaction. Operators must ensure recipients are notified before TTL expiry.
 - **Expired entries**: Cannot be recovered. Data is permanently lost.
 - **Contract liveness**: Instance storage stays alive as long as any function is called at least once per 7 days.
